@@ -1,0 +1,94 @@
+name: Build bq28z610.ko
+
+on:
+  push:
+    branches: [android12-5.10-2025-09]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu bc flex bison libssl-dev \
+            libelf-dev python3 cpio kmod
+
+      - name: Clone AOSP Clang
+        run: |
+          git clone --depth=1 \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            -b clang-r584948 \
+            prebuilts/clang
+          echo "CC=$(pwd)/prebuilts/clang/bin/clang" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+
+      - name: Configure kernel
+        run: |
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=$CLANG_TRIPLE \
+            CC=$CC \
+            gki_defconfig
+
+      - name: Prepare modules build
+        run: |
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=$CLANG_TRIPLE \
+            CC=$CC \
+            modules_prepare -j$(nproc)
+
+      - name: Build hwid module (for CRC)
+        run: |
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=$CLANG_TRIPLE \
+            CC=$CC \
+            M=drivers/misc/hwid \
+            modules -j$(nproc)
+
+      - name: Build bq28z610 module
+        run: |
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=$CLANG_TRIPLE \
+            CC=$CC \
+            M=drivers/power/supply \
+            modules -j$(nproc)
+
+      - name: Verify modules
+        run: |
+          echo "=== hwid.ko ==="
+          file drivers/misc/hwid/hwid.ko 2>/dev/null || echo "hwid.ko 未生成"
+          echo ""
+          echo "=== bq28z610.ko ==="
+          file drivers/power/supply/bq28z610.ko
+          echo ""
+          echo "=== vermagic ==="
+          strings drivers/power/supply/bq28z610.ko | grep vermagic
+          echo ""
+          echo "=== CRC 表 ==="
+          aarch64-linux-gnu-readelf -p __versions drivers/power/supply/bq28z610.ko 2>/dev/null | grep -i "get_hw_sku\|module_layout" | head -5
+          echo ""
+          echo "=== 符号表 (fg_read_ra_table) ==="
+          aarch64-linux-gnu-nm --defined-only drivers/power/supply/bq28z610.ko 2>/dev/null | grep -i "ra_table\|fg_read_ra" || echo "(fg_read_ra_table 未找到)"
+
+      - name: Upload bq28z610.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: bq28z610-xaga
+          path: drivers/power/supply/bq28z610.ko
+
+      - name: Upload hwid.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwid-xaga
+          path: drivers/misc/hwid/hwid.ko
