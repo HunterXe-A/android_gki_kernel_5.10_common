@@ -45,6 +45,7 @@ jobs:
 
       - name: Configure kernel
         run: |
+          echo "CONFIG_TARGET_PRODUCT_XAGA=y" >> arch/arm64/configs/gki_defconfig
           make ARCH=arm64 \
             SUBARCH=arm64 \
             CC="ccache clang" \
