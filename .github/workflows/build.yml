@@ -19,16 +19,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu bc flex bison libssl-dev \
-            libelf-dev python3 cpio kmod
+            libelf-dev python3 cpio kmod wget
 
-      - name: Clone AOSP Clang
+      - name: Download AOSP Clang
         run: |
-          git clone --depth=1 \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            -b mirror-goog-llvm-r584948-release \
-            prebuilts/clang
+          # 直接下载 tar.gz，避免 git clone 整个 prebuilts 仓库（太大）
+          wget -q --timeout=120 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-llvm-r584948-release.tar.gz" \
+            -O clang.tar.gz
+          mkdir -p prebuilts/clang
+          tar xf clang.tar.gz -C prebuilts/clang
+          rm clang.tar.gz
           echo "CC=$(pwd)/prebuilts/clang/bin/clang" >> $GITHUB_ENV
           echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "=== clang version ==="
+          prebuilts/clang/bin/clang --version 2>&1 | head -3
 
       - name: Configure kernel
         run: |
