@@ -32,9 +32,7 @@
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
 #include "bq28z610.h"
-#ifdef CONFIG_TARGET_PRODUCT_XAGA
 #include "../../../misc/hwid/hwid.h"
-#endif
 
 enum product_name {
 	XAGA_NO,
@@ -1149,11 +1147,7 @@ static int bq_battery_soc_smooth_tracking_new(struct bq_fg_chip *bq, int raw_soc
 
 	/*If the soc jump, will smooth one cap every 10S */
 	soc_delta = abs(system_soc - last_system_soc);
-#ifndef CONFIG_TARGET_PRODUCT_XAGA
-	if(soc_delta > 1 || (bq->vbat < 3300 && system_soc > 0) || (unit_time != 10000 && soc_delta == 1)){
-#else
 	if(soc_delta > 1 || (bq->vbat < 3400 && system_soc > 0) || (unit_time != 10000 && soc_delta == 1)){
-#endif
 		//unit_time != 10000 && soc_delta == 1 fix low temperature 2% jump to 0%
 		calc_delta_time(last_change_time, &change_delta);
 		delta_time = change_delta / unit_time;
@@ -2324,16 +2318,15 @@ static int fg_parse_dt(struct bq_fg_chip *bq)
 	if (ret)
 		fg_err("%s failed to parse old_critical_shutdown_vbat_1s\n", bq->log_tag);
 
-#ifndef CONFIG_TARGET_PRODUCT_XAGA
-	ret = of_property_read_u32(node, "report_full_rsoc_1s", &bq->report_full_rsoc);
-	if (ret)
-		fg_err("%s failed to parse report_full_rsoc_1s\n", bq->log_tag);
-#else
 	if (product_name == XAGA)
 		bq->report_full_rsoc = 9700;
 	else if (product_name == XAGAPRO)
 		bq->report_full_rsoc = 9500;
-#endif
+	else {
+		ret = of_property_read_u32(node, "report_full_rsoc_1s", &bq->report_full_rsoc);
+		if (ret)
+			fg_err("%s failed to parse report_full_rsoc_1s\n", bq->log_tag);
+	}
 
 	ret = of_property_read_u32(node, "soc_gap_1s", &bq->soc_gap);
 	if (ret)
@@ -2458,13 +2451,11 @@ static int fg_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	product_name=DAUMIER;
 #endif
 
-#if defined(CONFIG_TARGET_PRODUCT_XAGA)
 	const char *sku = get_hw_sku();
 	if (!strncmp(sku, "xagapro", strlen("xagapro")))
 		product_name = XAGAPRO;
 	else if (!strncmp(sku, "xaga", strlen("xaga")))
 		product_name = XAGA;
-#endif
 
 	fg_info("FG probe enter\n");
 	bq = devm_kzalloc(&client->dev, sizeof(*bq), GFP_DMA);
