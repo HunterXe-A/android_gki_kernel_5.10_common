@@ -32,7 +32,7 @@
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
 #include "bq28z610.h"
-#include "../../../misc/hwid/hwid.h"
+#include "../../misc/hwid/hwid.h"
 
 enum product_name {
 	XAGA_NO,
