@@ -11,59 +11,84 @@ jobs:
     timeout-minutes: 180
 
     steps:
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker system prune -af || true
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu bc flex bison libssl-dev \
-            libelf-dev python3 cpio kmod
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu bc bison flex libelf-dev libssl-dev \
+            libncurses-dev build-essential ccache python3 kmod
 
-      - name: Setup Clang
+      - name: 下载 Android NDK r28
         run: |
-          # ubuntu-latest 自带 clang，直接用系统版本
-          clang --version
+          URL="https://dl.google.com/android/repository/android-ndk-r28-linux.zip"
+          echo "下载: $URL"
+          curl -fL --retry 3 -o ndk.zip "$URL"
+          unzip -q ndk.zip
+          rm -f ndk.zip
+          mv android-ndk-r28 ndk
+          NDK_CLANG="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$NDK_CLANG" >> "$GITHUB_PATH"
+          echo "NDK 大小:"
+          du -sh ndk
+          echo ""
+          echo "=== clang version ==="
+          "$NDK_CLANG/clang" --version 2>&1 | head -3
 
       - name: Configure kernel
         run: |
           make ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
+            SUBARCH=arm64 \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-android- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            CC=clang \
+            LLVM=1 LLVM_IAS=1 \
             gki_defconfig
 
       - name: Prepare modules build
         run: |
           make ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
+            SUBARCH=arm64 \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-android- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            CC=clang \
+            LLVM=1 LLVM_IAS=1 \
             modules_prepare -j$(nproc)
 
       - name: Build hwid module (for CRC)
         run: |
           make ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
+            SUBARCH=arm64 \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-android- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            CC=clang \
+            LLVM=1 LLVM_IAS=1 \
             M=drivers/misc/hwid \
             modules -j$(nproc)
 
       - name: Build bq28z610 module
         run: |
           make ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
+            SUBARCH=arm64 \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-android- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            CC=clang \
+            LLVM=1 LLVM_IAS=1 \
             M=drivers/power/supply \
             modules -j$(nproc)
 
       - name: Verify modules
         run: |
           echo "=== clang version ==="
-          clang --version 2>&1 | head -2
+          clang --version 2>&1 | head -3
           echo ""
           echo "=== hwid.ko ==="
           file drivers/misc/hwid/hwid.ko 2>/dev/null || echo "hwid.ko 未生成"
