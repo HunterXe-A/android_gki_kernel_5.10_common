@@ -24,7 +24,7 @@ jobs:
       - name: Download AOSP Clang
         run: |
           # 直接下载 tar.gz，避免 git clone 整个 prebuilts 仓库（太大）
-          wget -q --timeout=120 \
+          wget \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-llvm-r584948-release.tar.gz" \
             -O clang.tar.gz
           mkdir -p prebuilts/clang
