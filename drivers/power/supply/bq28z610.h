@@ -24,7 +24,7 @@
 #include <linux/power_supply.h>
 #include <linux/alarmtimer.h>
 #include <linux/kernel.h>
-#include <linux/i2c.h> 
+#include <linux/i2c.h>
 
 #define RANDOM_CHALLENGE_LEN_MAX	32
 #define RANDOM_CHALLENGE_LEN_BQ27Z561	32
@@ -72,6 +72,30 @@ enum bq_fg_reg_idx {
 	BQ_FG_REG_MAC_DATA,	/* MACData*/
 	BQ_FG_REG_MAC_CHKSUM,	/* MACChecksum */
 	BQ_FG_REG_MAC_DATA_LEN,	/* MACDataLen */
+	NVT_FG_REG_OVER_PEAK,	/*over peak flag*/
+	NVT_FG_REG_CUR_DEV,	/*current deviation*/
+	NVT_FG_REG_POW_DEV,	/*power deviation*/
+	NVT_FG_AVE_CUR,	/*10s average current*/
+	NVT_FG_AVE_TEMP,	/*10s average tempature*/
+	NVT_FG_REG_SOA_L,	/* soa alert */
+	NVT_FG_REG_SOA_H,	/* soa alert */
+	NVT_FG_REG_ISC,	/* isc alert */
+	NVT_FG_REG_START_LEARNING,	/*start learning*/
+	NVT_FG_REG_STOP_LEARNING,	/*stop learning*/
+	NVT_FG_REG_EST_POWER,	/*Estimated power input*/
+	NVT_FG_REG_ACT_POWER,	/*Actual power output*/
+	NVT_FG_REG_POWER_DEV,	/*Estimated power-Actual power output*/
+	NVT_FG_REG_TIME_DEV,	/*Estimated power time-Actual power time output*/
+	NVT_FG_REG_CONST_POWER,	/*Constant power value*/
+	NVT_FG_REG_CONST_POWER_TM,	/*Constant power value time*/
+	NVT_FG_REG_REF_POWER,	/*Recommended reference power*/
+	NVT_FG_REG_REF_CURRENT,	/*nvt recommended discharge current*/
+	NVT_FG_REG_NVT_REF_CURRENT,	/*nvt recommended discharge power*/
+	NVT_FG_REG_START_LEARNING_B,	/*start learning B*/
+	NVT_FG_REG_STOP_LEARNING_B,	/*stop learning B*/
+	NVT_FG_REG_EST_POWER_B,	/*Estimated power input B*/
+	NVT_FG_REG_ACT_POWER_B,	/*Actual power output B*/
+	NVT_FG_REG_POWER_DEV_B,	/*Estimated power-Actual power output B*/
 	NUM_REGS,
 };
 
@@ -96,6 +120,30 @@ static u8 bq_fg_regs[NUM_REGS] = {
 	0x40,	/* MACData*/
 	0x60,	/* MACChecksum */
 	0x61,	/* MACDataLen */
+	0x78,	/*over peak flag*/
+	0x79,	/*current deviation*/
+	0x7B,	/*power deviation*/
+	0x81,	/*10s average current*/
+	0x83,	/*10s average tempature*/
+	0x70,   /*soa Alert */
+	0x71,   /*soa Alert */
+	0x72,   /* isc Alert level */
+	0x85,	/*start learning*/
+	0x86,	/*stop learning*/
+	0x87,	/*Estimated power input*/
+	0x89,	/*Actual power output*/
+	0x8B,	/*Estimated power-Actual power output*/
+	0x8D,	/*Estimated power time-Actual power time output*/
+	0xA1,	/*Constant power value*/
+	0xA3,	/*Constant power value time*/
+	0xA5,	/*Recommended reference power*/
+	0xA7,	/*nvt recommended discharge current*/
+	0xA9,	/*nvt recommended discharge power*/
+	0x93,	/*start learning B*/
+	0x94,	/*stop learning B*/
+	0x95,	/*Estimated power input B*/
+	0x97,	/*Actual power output B*/
+	0x99,	/*Estimated power-Actual power output B*/
 };
 
 enum bq_fg_mac_cmd {
@@ -129,6 +177,7 @@ struct bq_fg_chip {
 	struct i2c_client *client;
 	struct mutex i2c_rw_lock;
 	struct mutex data_lock;
+	struct regmap *regmap;
 
 	u8 regs[NUM_REGS];
 	char model_name[I2C_NAME_SIZE];
@@ -183,11 +232,15 @@ struct bq_fg_chip {
 	int	critical_shutdown_vbat;
 	int	cool_critical_shutdown_vbat;
 	int	old_critical_shutdown_vbat;
+	int	bq_charging_status;
 	bool	shutdown_delay;
 	bool	fake_shutdown_delay_enable;
 	bool	enable_shutdown_delay;
 	bool	shutdown_flag;
 	bool	shutdown_mode;
+	atomic_t fg_in_sleep;
+        int slave_connect_gpio;
+        int cell_supplier;
 };
 
 #define BMS_SYSFS_FIELD_RW(_name, _prop)	\
@@ -222,7 +275,19 @@ enum bms_property {
 	BMS_PROP_RESISTANCE,
 	BMS_PROP_I2C_ERROR_COUNT,
 	BMS_PROP_AV_CURRENT,
-	BMS_PROP_RAW_SOC,
+	BMS_PROP_TEMP_MAX,
+	BMS_PROP_TIME_OT,
+	BMS_PROP_BMS_SLAVE_CONNECT_ERROR,
+	BMS_PROP_CELL_SUPPLIER,
+	BMS_PROP_ISC_ALERT_LEVEL,
+	BMS_PROP_SOA_ALERT_LEVEL,
+};
+
+enum bms_cell_supplier {
+	BMS_CELL_UNKNOWN = 0,
+	BMS_CELL_LWN,
+	BMS_CELL_ATL,
+	BMS_CELL_COS,
 };
 
 struct mtk_bms_sysfs_field_info {
@@ -238,4 +303,3 @@ extern int bms_get_property(enum bms_property bp, int *val);
 extern int bms_set_property(enum bms_property bp, int val);
 
 #endif /* __PMIC_VOTER_H */
-
