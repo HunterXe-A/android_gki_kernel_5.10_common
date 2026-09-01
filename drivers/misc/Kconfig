@@ -5,6 +5,12 @@
 
 menu "Misc devices"
 
+config MI_HARDWARE_ID
+	tristate "Xiaomi hardware ID support"
+	depends on SYSFS
+	help
+	  Export Xiaomi hardware identification values to kernel drivers.
+
 config SENSORS_LIS3LV02D
 	tristate
 	depends on INPUT

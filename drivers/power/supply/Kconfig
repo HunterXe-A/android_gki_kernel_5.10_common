@@ -778,6 +778,7 @@ config RN5T618_POWER
 
 config XMEXT_TI_GAUGE
 	tristate "xmext use bq28z610 gauge"
+	depends on MI_HARDWARE_ID
 	help
 	  Say yes here to enable xmext use bq28z610 gauge driver.
 

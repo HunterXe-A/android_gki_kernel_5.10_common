@@ -165,6 +165,8 @@ enum bq_fg_mac_cmd {
 	FG_MAC_CMD_CHARGING_STATUS = 0x0055,
 	FG_MAC_CMD_LIFETIME1	= 0x0060,
 	FG_MAC_CMD_LIFETIME3	= 0x0062,
+	FG_MAC_CMD_OVER_VOL_DURATION = 0x0067,
+	FG_MAC_CMD_BATT_SN	= 0x0070,
 	FG_MAC_CMD_DASTATUS1	= 0x0071,
 	FG_MAC_CMD_ITSTATUS1	= 0x0073,
 	FG_MAC_CMD_QMAX		= 0x0075,
@@ -275,12 +277,14 @@ enum bms_property {
 	BMS_PROP_RESISTANCE,
 	BMS_PROP_I2C_ERROR_COUNT,
 	BMS_PROP_AV_CURRENT,
+	BMS_PROP_VOLTAGE_MAX,
 	BMS_PROP_TEMP_MAX,
 	BMS_PROP_TIME_OT,
 	BMS_PROP_BMS_SLAVE_CONNECT_ERROR,
 	BMS_PROP_CELL_SUPPLIER,
 	BMS_PROP_ISC_ALERT_LEVEL,
 	BMS_PROP_SOA_ALERT_LEVEL,
+	BMS_PROP_OVER_VOL_DURATION,
 };
 
 enum bms_cell_supplier {
@@ -301,5 +305,6 @@ struct mtk_bms_sysfs_field_info {
 
 extern int bms_get_property(enum bms_property bp, int *val);
 extern int bms_set_property(enum bms_property bp, int val);
+extern int bms_get_batt_sn(struct power_supply *psy, u8 *buf);
 
 #endif /* __PMIC_VOTER_H */

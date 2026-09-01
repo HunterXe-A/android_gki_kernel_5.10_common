@@ -1633,6 +1633,21 @@ static ssize_t bms_sysfs_show(struct device *dev,
 	return count;
 }
 
+static int voltage_max_get(struct bq_fg_chip *gm,
+	struct mtk_bms_sysfs_field_info *attr,
+	int *val)
+{
+	u8 data[32] = {0};
+	int ret;
+
+	ret = fg_mac_read_block(gm, FG_MAC_CMD_LIFETIME1, data, sizeof(data));
+	if (ret)
+		fg_err("failed to get FG_MAC_CMD_LIFETIME1 for voltage_max\n");
+
+	*val = data[0] | (data[1] << 8);
+	return 0;
+}
+
 static int temp_max_get(struct bq_fg_chip *gm,
 	struct mtk_bms_sysfs_field_info *attr,
 	int *val)
@@ -1713,6 +1728,22 @@ int isc_alert_level_get(struct bq_fg_chip *gm,
 	return ret;
 }
 
+static int over_vol_duration_get(struct bq_fg_chip *gm,
+	struct mtk_bms_sysfs_field_info *attr,
+	int *val)
+{
+	u8 data[32] = {0};
+	int ret;
+
+	ret = fg_mac_read_block(gm, FG_MAC_CMD_OVER_VOL_DURATION, data, 12);
+	if (ret)
+		fg_err("failed to get FG_MAC_CMD_OVER_VOL_DURATION\n");
+
+	*val = (int)(data[8] | ((u32)data[9] << 8) |
+		((u32)data[10] << 16) | ((u32)data[11] << 24));
+	return 0;
+}
+
 int soa_alert_level_get(struct bq_fg_chip *gm,
 	struct mtk_bms_sysfs_field_info *attr,
 	int *val)
@@ -1758,12 +1789,14 @@ static struct mtk_bms_sysfs_field_info bms_sysfs_field_tbl[] = {
 	BMS_SYSFS_FIELD_RO(resistance, BMS_PROP_RESISTANCE),
 	BMS_SYSFS_FIELD_RW(i2c_error_count, BMS_PROP_I2C_ERROR_COUNT),
 	BMS_SYSFS_FIELD_RO(av_current, BMS_PROP_AV_CURRENT),
+	BMS_SYSFS_FIELD_RO(voltage_max, BMS_PROP_VOLTAGE_MAX),
 	BMS_SYSFS_FIELD_RO(temp_max, BMS_PROP_TEMP_MAX),
 	BMS_SYSFS_FIELD_RO(time_ot, BMS_PROP_TIME_OT),
 	BMS_SYSFS_FIELD_RO(bms_slave_connect_error, BMS_PROP_BMS_SLAVE_CONNECT_ERROR),
 	BMS_SYSFS_FIELD_RO(cell_supplier, BMS_PROP_CELL_SUPPLIER),
 	BMS_SYSFS_FIELD_RO(isc_alert_level, BMS_PROP_ISC_ALERT_LEVEL),
 	BMS_SYSFS_FIELD_RO(soa_alert_level, BMS_PROP_SOA_ALERT_LEVEL),
+	BMS_SYSFS_FIELD_RO(over_vol_duration, BMS_PROP_OVER_VOL_DURATION),
 };
 
 int bms_get_property(enum bms_property bp,
@@ -1771,6 +1804,9 @@ int bms_get_property(enum bms_property bp,
 {
 	struct bq_fg_chip *gm;
 	struct power_supply *psy;
+
+	if (bp < 0 || bp >= ARRAY_SIZE(bms_sysfs_field_tbl))
+		return -EINVAL;
 
 	psy = power_supply_get_by_name("bms");
 	if (psy == NULL)
@@ -1789,11 +1825,38 @@ int bms_get_property(enum bms_property bp,
 }
 EXPORT_SYMBOL(bms_get_property);
 
+int bms_get_batt_sn(struct power_supply *psy, u8 *buf)
+{
+	struct bq_fg_chip *gm;
+	u8 data[32] = {0};
+	int ret;
+
+	if (!psy || !buf)
+		return -1;
+
+	gm = power_supply_get_drvdata(psy);
+	if (!gm)
+		return -1;
+
+	ret = fg_mac_read_block(gm, FG_MAC_CMD_BATT_SN, data, sizeof(data));
+	if (ret) {
+		fg_err("failed to get BATT_SN\n");
+		return -1;
+	}
+
+	memcpy(buf, data, sizeof(data));
+	return 0;
+}
+EXPORT_SYMBOL(bms_get_batt_sn);
+
 int bms_set_property(enum bms_property bp,
 			    int val)
 {
 	struct bq_fg_chip *gm;
 	struct power_supply *psy;
+
+	if (bp < 0 || bp >= ARRAY_SIZE(bms_sysfs_field_tbl))
+		return -EINVAL;
 
 	psy = power_supply_get_by_name("bms");
 	if (psy == NULL)
