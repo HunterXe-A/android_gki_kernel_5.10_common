@@ -62,25 +62,66 @@ jobs:
             CC="ccache clang" \
             HOSTCC="ccache clang" \
             gki_defconfig
+          sed -i \
+            -e '/^CONFIG_LOCALVERSION_AUTO=/d' \
+            -e '/^# CONFIG_LOCALVERSION_AUTO is not set$/d' \
+            "$KBUILD_OUTPUT/.config"
+          printf '%s\n' '# CONFIG_LOCALVERSION_AUTO is not set' \
+            >> "$KBUILD_OUTPUT/.config"
+          make O="$KBUILD_OUTPUT" \
+            CC="ccache clang" \
+            HOSTCC="ccache clang" \
+            olddefconfig
+          grep -q '^# CONFIG_LOCALVERSION_AUTO is not set$' "$KBUILD_OUTPUT/.config"
+          test "$(make O="$KBUILD_OUTPUT" kernelrelease)" = "5.10.240-ztc1997"
           grep -q '^CONFIG_MODULES=y$' "$KBUILD_OUTPUT/.config"
+          grep -q '^CONFIG_LTO_CLANG_FULL=y$' "$KBUILD_OUTPUT/.config"
+          ! grep -q '^CONFIG_LTO_CLANG_THIN=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_MODVERSIONS=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_CFI_CLANG=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_MI_HARDWARE_ID=m$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_XMEXT_TI_GAUGE=m$' "$KBUILD_OUTPUT/.config"
 
-      - name: Build kernel symbol table
+      - name: Build kernel symbol table with ThinLTO
         run: |
-          make O="$KBUILD_OUTPUT" \
+          SYMVERS_OUTPUT=out-symvers
+          make O="$SYMVERS_OUTPUT" \
+            CC="ccache clang" \
+            HOSTCC="ccache clang" \
+            gki_defconfig
+          sed -i \
+            -e '/^CONFIG_LOCALVERSION_AUTO=/d' \
+            -e '/^# CONFIG_LOCALVERSION_AUTO is not set$/d' \
+            -e 's/^CONFIG_LTO_CLANG_FULL=y$/# CONFIG_LTO_CLANG_FULL is not set/' \
+            -e 's/^# CONFIG_LTO_CLANG_THIN is not set$/CONFIG_LTO_CLANG_THIN=y/' \
+            "$SYMVERS_OUTPUT/.config"
+          printf '%s\n' '# CONFIG_LOCALVERSION_AUTO is not set' \
+            >> "$SYMVERS_OUTPUT/.config"
+          grep -q '^# CONFIG_LTO_CLANG_FULL is not set$' "$SYMVERS_OUTPUT/.config"
+          grep -q '^CONFIG_LTO_CLANG_THIN=y$' "$SYMVERS_OUTPUT/.config"
+          make O="$SYMVERS_OUTPUT" \
+            CC="ccache clang" \
+            HOSTCC="ccache clang" \
+            olddefconfig
+          grep -q '^# CONFIG_LOCALVERSION_AUTO is not set$' "$SYMVERS_OUTPUT/.config"
+          test "$(make O="$SYMVERS_OUTPUT" kernelrelease)" = "5.10.240-ztc1997"
+          grep -q '^CONFIG_MODULES=y$' "$SYMVERS_OUTPUT/.config"
+          grep -q '^CONFIG_MODVERSIONS=y$' "$SYMVERS_OUTPUT/.config"
+          grep -q '^CONFIG_CFI_CLANG=y$' "$SYMVERS_OUTPUT/.config"
+          grep -q '^CONFIG_LTO_CLANG_THIN=y$' "$SYMVERS_OUTPUT/.config"
+          make O="$SYMVERS_OUTPUT" \
             CC="ccache clang" \
             HOSTCC="ccache clang" \
             vmlinux -j"$(nproc)"
-          test -s "$KBUILD_OUTPUT/vmlinux"
-          test -s "$KBUILD_OUTPUT/vmlinux.symvers"
-          grep -q '[[:space:]]module_layout[[:space:]]' "$KBUILD_OUTPUT/vmlinux.symvers"
+          test -s "$SYMVERS_OUTPUT/vmlinux"
+          test -s "$SYMVERS_OUTPUT/vmlinux.symvers"
+          test -s "$SYMVERS_OUTPUT/System.map"
+          grep -q '[[:space:]]module_layout[[:space:]]' "$SYMVERS_OUTPUT/vmlinux.symvers"
 
       - name: Build hwid and bq modules in one modpost
         run: |
           make O="$KBUILD_OUTPUT" \
+            KBUILD_MIXED_TREE="$GITHUB_WORKSPACE/out-symvers" \
             CC="ccache clang" \
             HOSTCC="ccache clang" \
             drivers/misc/hwid/hwid.ko \
@@ -89,6 +130,8 @@ jobs:
           test -s "$KBUILD_OUTPUT/drivers/misc/hwid/hwid.ko"
           test -s "$KBUILD_OUTPUT/drivers/power/supply/bq28z610.ko"
           test -s "$KBUILD_OUTPUT/modules-only.symvers"
+          cp "$GITHUB_WORKSPACE/out-symvers/vmlinux.symvers" \
+            "$KBUILD_OUTPUT/vmlinux.symvers"
           cat "$KBUILD_OUTPUT/vmlinux.symvers" \
             "$KBUILD_OUTPUT/modules-only.symvers" > "$KBUILD_OUTPUT/Module.symvers"
           test -s "$KBUILD_OUTPUT/Module.symvers"
@@ -232,6 +275,12 @@ jobs:
             out/drivers/misc/hwid/hwid.ko
             out/Module.symvers
             out/vmlinux.symvers
+            out/modules-only.symvers
+            out/include/config/kernel.release
+            out/.config
+            out-symvers/vmlinux.symvers
+            out-symvers/System.map
+            out-symvers/.config
             bq.header.txt
             hwid.header.txt
             bq.modinfo.txt
