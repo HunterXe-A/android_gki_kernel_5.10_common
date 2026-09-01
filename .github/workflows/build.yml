@@ -76,7 +76,7 @@ jobs:
             HOSTCC="ccache clang" \
             olddefconfig
           grep -q '^# CONFIG_LOCALVERSION_AUTO is not set$' "$KBUILD_OUTPUT/.config"
-          KERNEL_RELEASE="$(make O="$KBUILD_OUTPUT" kernelrelease)"
+          KERNEL_RELEASE="$(make --no-print-directory O="$KBUILD_OUTPUT" kernelrelease)"
           printf 'target kernelrelease=%s\n' "$KERNEL_RELEASE"
           test "$KERNEL_RELEASE" = "5.10.240-ztc1997"
           grep -q '^CONFIG_MODULES=y$' "$KBUILD_OUTPUT/.config"
@@ -109,7 +109,9 @@ jobs:
             HOSTCC="ccache clang" \
             olddefconfig
           grep -q '^# CONFIG_LOCALVERSION_AUTO is not set$' "$SYMVERS_OUTPUT/.config"
-          test "$(make O="$SYMVERS_OUTPUT" kernelrelease)" = "5.10.240-ztc1997"
+          KERNEL_RELEASE="$(make --no-print-directory O="$SYMVERS_OUTPUT" kernelrelease)"
+          printf 'symvers kernelrelease=%s\n' "$KERNEL_RELEASE"
+          test "$KERNEL_RELEASE" = "5.10.240-ztc1997"
           grep -q '^CONFIG_MODULES=y$' "$SYMVERS_OUTPUT/.config"
           grep -q '^CONFIG_MODVERSIONS=y$' "$SYMVERS_OUTPUT/.config"
           grep -q '^CONFIG_CFI_CLANG=y$' "$SYMVERS_OUTPUT/.config"
