@@ -16,6 +16,7 @@ env:
   CROSS_COMPILE: aarch64-linux-android-
   CLANG_TRIPLE: aarch64-linux-gnu-
   KBUILD_OUTPUT: out
+  LOCALVERSION: ""
 
 jobs:
   build:
