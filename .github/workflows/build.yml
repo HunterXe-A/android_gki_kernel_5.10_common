@@ -224,9 +224,12 @@ jobs:
           llvm-nm -a "$BQ" > bq.nm.txt
           llvm-nm -a "$HWID" > hwid.nm.txt
           HWID_SKU_CRC="$(awk '$3 == "__crc_get_hw_sku" {print tolower($1); exit}' hwid.nm.txt)"
+          printf 'get_hw_sku module CRC=%s expected=%s\n' \
+            "$HWID_SKU_CRC" 000000008a6b6b4f
           test "$HWID_SKU_CRC" = "000000008a6b6b4f"
           awk '$2 == "get_hw_sku" {print}' out/modules-only.symvers > hwid.symvers.txt
           test -s hwid.symvers.txt
+          cat hwid.symvers.txt
           awk '$2 == "get_hw_sku" && tolower($1) == "0x8a6b6b4f" {found=1} END {exit !found}' \
             out/modules-only.symvers
 
@@ -235,6 +238,7 @@ jobs:
             local expected="$2"
             local actual
             actual="$(awk -v symbol="__crc_$symbol" '$3 == symbol {print tolower($1); exit}' bq.nm.txt)"
+            printf '%s module CRC=%s expected=%s\n' "$symbol" "$actual" "$expected"
             test "$actual" = "$expected"
           }
           check_export_crc bms_get_property 000000000f62fe56
@@ -244,9 +248,10 @@ jobs:
           check_symvers_crc() {
             local symbol="$1"
             local expected="$2"
-            awk -v symbol="$symbol" -v expected="$expected" \
-              '$2 == symbol && tolower($1) == expected {found=1} END {exit !found}' \
-              out/Module.symvers
+            local actual
+            actual="$(awk -v symbol="$symbol" '$2 == symbol {print tolower($1); exit}' out/Module.symvers)"
+            printf '%s symvers CRC=%s expected=%s\n' "$symbol" "$actual" "$expected"
+            test "$actual" = "$expected"
           }
           check_symvers_crc bms_get_property 0x0f62fe56
           check_symvers_crc bms_set_property 0xce2dc0be
@@ -258,13 +263,16 @@ jobs:
 
           grep -q '^CONFIG_CFI_CLANG=y$' out/.config
           if grep -q '^CONFIG_MODULE_SIG=y$' out/.config; then
+            echo 'module signature enforcement: enabled'
             test -s out/signing_key.x509
             grep -q '^CONFIG_MODULE_SIG_ALL=y$' out/.config
             test -s out/scripts/sign-file
           else
-            ! grep -q '^CONFIG_MODULE_SIG_FORCE=y$' out/.config
             echo 'module signature enforcement: disabled'
+            ! grep -q '^CONFIG_MODULE_SIG_FORCE=y$' out/.config
           fi
+          echo 'CFI entry points:'
+          awk '$3 ~ /^__cfi_(check|jt_start|jt_end)$/ {print}' bq.nm.txt
           grep -q '[[:space:]]__cfi_check$' bq.nm.txt
           grep -q '[[:space:]]__cfi_jt_start$' bq.nm.txt
           grep -q '[[:space:]]__cfi_jt_end$' bq.nm.txt
