@@ -1825,7 +1825,7 @@ int bms_get_property(enum bms_property bp,
 }
 EXPORT_SYMBOL(bms_get_property);
 
-int bms_get_batt_sn(struct power_supply *psy, u8 *buf)
+int bms_get_batt_sn(struct power_supply *psy, char *buf)
 {
 	struct bq_fg_chip *gm;
 	u8 data[32] = {0};

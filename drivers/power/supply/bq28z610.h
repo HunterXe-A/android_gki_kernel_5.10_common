@@ -305,6 +305,6 @@ struct mtk_bms_sysfs_field_info {
 
 extern int bms_get_property(enum bms_property bp, int *val);
 extern int bms_set_property(enum bms_property bp, int val);
-extern int bms_get_batt_sn(struct power_supply *psy, u8 *buf);
+extern int bms_get_batt_sn(struct power_supply *psy, char *buf);
 
 #endif /* __PMIC_VOTER_H */
