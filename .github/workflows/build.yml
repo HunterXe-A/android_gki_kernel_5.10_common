@@ -65,6 +65,7 @@ jobs:
             CC="ccache clang" \
             HOSTCC="ccache clang" \
             gki_defconfig
+          printf '%s\n' 'CONFIG_I2C_SMBUS=y' >> "$KBUILD_OUTPUT/.config"
           printf '%s\n' 'CONFIG_BQ_RA_READER=m' >> "$KBUILD_OUTPUT/.config"
           sed -i \
             -e '/^CONFIG_LOCALVERSION_AUTO=/d' \
