@@ -11,6 +11,8 @@ config MI_HARDWARE_ID
 	help
 	  Export Xiaomi hardware identification values to kernel drivers.
 
+source "drivers/misc/bq_ra_reader/Kconfig"
+
 config SENSORS_LIS3LV02D
 	tristate
 	depends on INPUT

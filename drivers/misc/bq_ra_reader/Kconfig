@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0
+config BQ_RA_READER
+	tristate "BQ28Z610 RA table reader"
+	depends on I2C && I2C_SMBUS && SYSFS
+	help
+	  Read the NFG1000B/BQ28Z610 RA table through a read-only sysfs node.
