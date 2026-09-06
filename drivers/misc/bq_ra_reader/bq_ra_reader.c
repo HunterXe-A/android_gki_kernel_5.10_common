@@ -11,6 +11,20 @@
 #include <linux/string.h>
 #include <linux/sysfs.h>
 
+/*
+ * 设备内核 CONFIG_UBSAN=n + CONFIG_TRIM_UNUSED_KSYMS=y，未导出
+ * __ubsan_handle_cfi_check_fail_abort（CFI enforcing 的失败处理函数）。
+ * 编译器在受 CFI 保护的函数里会引用它，模块加载时解析不到导致
+ * "Unknown symbol __ubsan_handle_cfi_check_fail_abort (err -2)"。
+ * 这里在模块内自带实现，避免依赖内核导出；正常路径（CFI 检查通过）
+ * 不会调用它，仅为满足链接/加载。no_sanitize("cfi") 防止该函数
+ * 自身又被 CFI 检查（否则自引用死循环）。
+ */
+__attribute__((no_sanitize("cfi")))
+void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
+{
+}
+
 #define BQ_RA_BUS		7
 #define BQ_RA_ADDR		0x55
 #define BQ_RA_DRIVER_NAME	"bq28z610"
