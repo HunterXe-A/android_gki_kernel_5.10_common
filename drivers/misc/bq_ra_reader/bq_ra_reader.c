@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Read MAC (AltManufacturerAccess) commands from NFG1000B/BQ28Z610
- * without replacing its driver. Probe mode: DAStatus1 (0x0071). */
+ * without replacing its driver. Probe mode: ITStatus1 (0x0073). */
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/i2c-smbus.h>
@@ -33,9 +33,9 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define BQ_RA_ADDR		0x55
 #define BQ_RA_DRIVER_NAME	"bq28z610"
 #define BQ_RA_REG_ALT_MAC	0x3e
-#define BQ_RA_CMD		0x0071	/* DAStatus1: cell voltages */
+#define BQ_RA_CMD		0x0073	/* ITStatus1: Impedance Track status */
 #define BQ_RA_READ_LEN		36
-#define BQ_RA_DATA_LEN		32
+#define BQ_RA_DATA_LEN		24
 
 static struct i2c_client *ra_client;
 static struct kobject *ra_kobj;
@@ -151,6 +151,18 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 		return -EBADMSG;
 
 	memcpy(data, &response[2], BQ_RA_DATA_LEN);
+
+	/* ITStatus1: highlight the Impedance Track fields of interest.
+	 * data[i] = response[i+2], so comp_res1=data[20..21]=response[22..23],
+	 * comp_res2=data[22..23]=response[24..25],
+	 * ra_scale0=data[16..17]=response[18..19],
+	 * ra_scale1=data[18..19]=response[20..21]. */
+	pr_info("bq_ra_reader: >> comp_res1=%u comp_res2=%u"
+		" ra_scale0=%u ra_scale1=%u\n",
+		(response[23] << 8) | response[22],
+		(response[25] << 8) | response[24],
+		(response[19] << 8) | response[18],
+		(response[21] << 8) | response[20]);
 	return 0;
 }
 
@@ -192,13 +204,27 @@ out_unlock:
 		return ret;
 	}
 
-	/* DAStatus1: data[0..1] and data[2..3] are little-endian u16 cell
-	 * voltages in mV (same parse as fg_read_cell_voltage()). */
+	/* ITStatus1: data[] holds 12 little-endian u16 fields (24 bytes):
+	 * [0]true_rem_q [2]true_rem_e [4]initial_q [6]initial_e
+	 * [8]true_full_chg_q [10]true_full_chg_e [12]t_sim [14]t_ambient
+	 * [16]ra_scale0 [18]ra_scale1 [20]comp_res1 [22]comp_res2
+	 * Raw values only; no unit/scale conversion until real data validates it.
+	 * comp_res1/comp_res2 (computed resistances) are the focus, listed first. */
 	len = sysfs_emit(buf,
 		"mac_probe: cmd=0x%04x bus=%d addr=0x%02x\n"
-		"cell0_mv=%u cell1_mv=%u\n",
+		"[COMP_RES] comp_res1=%u comp_res2=%u\n"
+		"ra_scale0=%u ra_scale1=%u\n"
+		"true_rem_q=%u true_rem_e=%u\n"
+		"initial_q=%u initial_e=%u\n"
+		"true_full_chg_q=%u true_full_chg_e=%u\n"
+		"t_sim=%u t_ambient=%u\n",
 		BQ_RA_CMD, client->adapter->nr, client->addr,
-		(data[1] << 8) | data[0], (data[3] << 8) | data[2]);
+		(data[21] << 8) | data[20], (data[23] << 8) | data[22],
+		(data[17] << 8) | data[16], (data[19] << 8) | data[18],
+		(data[1] << 8) | data[0], (data[3] << 8) | data[2],
+		(data[5] << 8) | data[4], (data[7] << 8) | data[6],
+		(data[9] << 8) | data[8], (data[11] << 8) | data[10],
+		(data[13] << 8) | data[12], (data[15] << 8) | data[14]);
 	for (i = 0; i < BQ_RA_DATA_LEN; i++)
 		len += sysfs_emit_at(buf, len, "%02x%c", data[i],
 			i == BQ_RA_DATA_LEN - 1 ? '\n' : ' ');
@@ -268,5 +294,5 @@ static void __exit bq_ra_reader_exit(void)
 module_init(bq_ra_reader_init);
 module_exit(bq_ra_reader_exit);
 
-MODULE_DESCRIPTION("BQ28Z610 MAC probe (DAStatus1)");
+MODULE_DESCRIPTION("BQ28Z610 MAC probe (ITStatus1)");
 MODULE_LICENSE("GPL v2");
