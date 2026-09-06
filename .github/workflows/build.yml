@@ -96,6 +96,8 @@ jobs:
           grep -q '^CONFIG_BQ_RA_READER=m$' "$KBUILD_OUTPUT/.config"
 
       - name: Download kernel symbol table (reuse previous build)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # 内核源码/配置未变，vmlinux.symvers 与 System.map 与上次构建完全一致。
           # 从最近一次成功 run 的 artifact 复用，跳过约 15 分钟的 ThinLTO vmlinux 重建。
