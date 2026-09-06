@@ -142,11 +142,9 @@ jobs:
             drivers/misc/bq_ra_reader/bq_ra_reader.ko \
             -j"$(nproc)"
           test -s "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/bq_ra_reader.ko"
+          # kbuild's modpost already generated modules-only.symvers and
+          # catted it with the mixed-tree vmlinux.symvers into Module.symvers.
           test -s "$KBUILD_OUTPUT/modules-only.symvers"
-          cp "$GITHUB_WORKSPACE/out-symvers/vmlinux.symvers" \
-            "$KBUILD_OUTPUT/vmlinux.symvers"
-          cat "$KBUILD_OUTPUT/vmlinux.symvers" \
-            "$KBUILD_OUTPUT/modules-only.symvers" > "$KBUILD_OUTPUT/Module.symvers"
           test -s "$KBUILD_OUTPUT/Module.symvers"
 
       - name: Verify bq_ra_reader ABI and metadata
