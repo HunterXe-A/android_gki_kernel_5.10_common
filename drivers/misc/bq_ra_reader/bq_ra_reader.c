@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Read the NFG1000B/BQ28Z610 RA table without replacing its driver. */
+/* Read MAC (AltManufacturerAccess) commands from NFG1000B/BQ28Z610
+ * without replacing its driver. Probe mode: DAStatus1 (0x0071). */
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/i2c-smbus.h>
@@ -32,9 +33,9 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define BQ_RA_ADDR		0x55
 #define BQ_RA_DRIVER_NAME	"bq28z610"
 #define BQ_RA_REG_ALT_MAC	0x3e
-#define BQ_RA_CMD		0x00e0
-#define BQ_RA_READ_LEN		34
-#define BQ_RA_DATA_LEN		30
+#define BQ_RA_CMD		0x0071	/* DAStatus1: cell voltages */
+#define BQ_RA_READ_LEN		36
+#define BQ_RA_DATA_LEN		32
 
 static struct i2c_client *ra_client;
 static struct kobject *ra_kobj;
@@ -127,12 +128,12 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 
 	length = response[BQ_RA_READ_LEN - 1];
 
-	pr_info("bq_ra_reader: RA raw[0..33]:"
+	pr_info("bq_ra_reader: mac raw[0..35]:"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
-		" %02x %02x len=%u cksum=%02x calc=%02x\n",
+		" %02x %02x %02x %02x len=%u cksum=%02x calc=%02x\n",
 		response[0], response[1], response[2], response[3],
 		response[4], response[5], response[6], response[7],
 		response[8], response[9], response[10], response[11],
@@ -141,8 +142,8 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 		response[20], response[21], response[22], response[23],
 		response[24], response[25], response[26], response[27],
 		response[28], response[29], response[30], response[31],
-		response[32], response[33],
-		length, response[32], ra_checksum(response, length - 2));
+		response[32], response[33], response[34], response[35],
+		length, response[34], ra_checksum(response, length - 2));
 
 	if (length < 3 || length > BQ_RA_READ_LEN)
 		return -EBADMSG;
@@ -187,12 +188,17 @@ static ssize_t ra_table_show(struct kobject *kobj,
 out_unlock:
 	mutex_unlock(&ra_lock);
 	if (ret) {
-		pr_err_ratelimited("bq_ra_reader: RA read failed: %d\n", ret);
+		pr_err_ratelimited("bq_ra_reader: mac probe failed: %d\n", ret);
 		return ret;
 	}
 
-	len = sysfs_emit(buf, "command=0x%04x bus=%d addr=0x%02x\n",
-		BQ_RA_CMD, client->adapter->nr, client->addr);
+	/* DAStatus1: data[0..1] and data[2..3] are little-endian u16 cell
+	 * voltages in mV (same parse as fg_read_cell_voltage()). */
+	len = sysfs_emit(buf,
+		"mac_probe: cmd=0x%04x bus=%d addr=0x%02x\n"
+		"cell0_mv=%u cell1_mv=%u\n",
+		BQ_RA_CMD, client->adapter->nr, client->addr,
+		(data[1] << 8) | data[0], (data[3] << 8) | data[2]);
 	for (i = 0; i < BQ_RA_DATA_LEN; i++)
 		len += sysfs_emit_at(buf, len, "%02x%c", data[i],
 			i == BQ_RA_DATA_LEN - 1 ? '\n' : ' ');
@@ -262,5 +268,5 @@ static void __exit bq_ra_reader_exit(void)
 module_init(bq_ra_reader_init);
 module_exit(bq_ra_reader_exit);
 
-MODULE_DESCRIPTION("Read BQ28Z610/NFG1000B RA table");
+MODULE_DESCRIPTION("BQ28Z610 MAC probe (DAStatus1)");
 MODULE_LICENSE("GPL v2");
