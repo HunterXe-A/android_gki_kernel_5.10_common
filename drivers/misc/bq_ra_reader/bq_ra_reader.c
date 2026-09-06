@@ -101,13 +101,16 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 	int ret;
 	int i;
 
-	/* Match fg_write_block(): write the MAC command one byte at a time. */
+	/* Match fg_write_block(): write the MAC command to the two
+	 * consecutive registers ALT_MAC (lo byte) and ALT_MAC+1 (hi byte).
+	 * Writing both bytes to ALT_MAC would overwrite the first byte.
+	 */
 	value = BQ_RA_CMD & 0xff;
 	ret = ra_smbus_byte_data(client, false, BQ_RA_REG_ALT_MAC, &value);
 	if (ret)
 		return ret;
 	value = BQ_RA_CMD >> 8;
-	ret = ra_smbus_byte_data(client, false, BQ_RA_REG_ALT_MAC, &value);
+	ret = ra_smbus_byte_data(client, false, BQ_RA_REG_ALT_MAC + 1, &value);
 	if (ret)
 		return ret;
 
