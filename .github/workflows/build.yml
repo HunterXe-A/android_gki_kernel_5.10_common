@@ -135,17 +135,19 @@ jobs:
 
       - name: Build bq_ra_reader module
         run: |
+          set -x
           make O="$KBUILD_OUTPUT" \
             KBUILD_MIXED_TREE="$GITHUB_WORKSPACE/out-symvers" \
             CC="ccache clang" \
             HOSTCC="ccache clang" \
             drivers/misc/bq_ra_reader/bq_ra_reader.ko \
-            -j"$(nproc)"
-          test -s "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/bq_ra_reader.ko"
-          # kbuild's modpost already generated modules-only.symvers and
-          # catted it with the mixed-tree vmlinux.symvers into Module.symvers.
-          test -s "$KBUILD_OUTPUT/modules-only.symvers"
-          test -s "$KBUILD_OUTPUT/Module.symvers"
+            -j"$(nproc)" || { echo "FAIL: make exit code $?"; exit 1; }
+          echo "make OK"
+          ls -la "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/" 2>&1
+          test -s "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/bq_ra_reader.ko" || { echo "FAIL: .ko missing"; exit 1; }
+          ls -la "$KBUILD_OUTPUT"/modules-only.symvers "$KBUILD_OUTPUT"/Module.symvers 2>&1
+          test -s "$KBUILD_OUTPUT/modules-only.symvers" || { echo "FAIL: modules-only.symvers missing"; exit 1; }
+          test -s "$KBUILD_OUTPUT/Module.symvers" || { echo "FAIL: Module.symvers missing"; exit 1; }
 
       - name: Verify bq_ra_reader ABI and metadata
         env:
