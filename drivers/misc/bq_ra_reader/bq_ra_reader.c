@@ -20,7 +20,10 @@
  * 不会调用它，仅为满足链接/加载。no_sanitize("cfi") 防止该函数
  * 自身又被 CFI 检查（否则自引用死循环）。
  */
-__attribute__((no_sanitize("cfi")))
+/* used 防止 LTO_FULL 将未被实际调用的 stub 当死代码剥离（剥离后
+ * 符号仍是 U 引用，加载依旧失败）；no_sanitize 防止 stub 自引用。
+ */
+__attribute__((used, no_sanitize("cfi")))
 void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 {
 }

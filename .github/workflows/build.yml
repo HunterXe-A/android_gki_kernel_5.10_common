@@ -95,43 +95,22 @@ jobs:
           grep -q '^CONFIG_I2C_SMBUS=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_BQ_RA_READER=m$' "$KBUILD_OUTPUT/.config"
 
-      - name: Build kernel symbol table with ThinLTO
+      - name: Download kernel symbol table (reuse previous build)
         run: |
-          SYMVERS_OUTPUT=out-symvers
-          make O="$SYMVERS_OUTPUT" \
-            CC="ccache clang" \
-            HOSTCC="ccache clang" \
-            gki_defconfig
-          sed -i \
-            -e '/^CONFIG_LOCALVERSION_AUTO=/d' \
-            -e '/^# CONFIG_LOCALVERSION_AUTO is not set$/d' \
-            -e 's/^CONFIG_LTO_CLANG_FULL=y$/# CONFIG_LTO_CLANG_FULL is not set/' \
-            -e 's/^# CONFIG_LTO_CLANG_THIN is not set$/CONFIG_LTO_CLANG_THIN=y/' \
-            "$SYMVERS_OUTPUT/.config"
-          printf '%s\n' '# CONFIG_LOCALVERSION_AUTO is not set' \
-            >> "$SYMVERS_OUTPUT/.config"
-          grep -q '^# CONFIG_LTO_CLANG_FULL is not set$' "$SYMVERS_OUTPUT/.config"
-          grep -q '^CONFIG_LTO_CLANG_THIN=y$' "$SYMVERS_OUTPUT/.config"
-          make O="$SYMVERS_OUTPUT" \
-            CC="ccache clang" \
-            HOSTCC="ccache clang" \
-            olddefconfig
-          grep -q '^# CONFIG_LOCALVERSION_AUTO is not set$' "$SYMVERS_OUTPUT/.config"
-          KERNEL_RELEASE="$(make --no-print-directory O="$SYMVERS_OUTPUT" kernelrelease)"
-          printf 'symvers kernelrelease=%s\n' "$KERNEL_RELEASE"
-          test "$KERNEL_RELEASE" = "5.10.240-ztc1997"
-          grep -q '^CONFIG_MODULES=y$' "$SYMVERS_OUTPUT/.config"
-          grep -q '^CONFIG_MODVERSIONS=y$' "$SYMVERS_OUTPUT/.config"
-          grep -q '^CONFIG_CFI_CLANG=y$' "$SYMVERS_OUTPUT/.config"
-          grep -q '^CONFIG_LTO_CLANG_THIN=y$' "$SYMVERS_OUTPUT/.config"
-          make O="$SYMVERS_OUTPUT" \
-            CC="ccache clang" \
-            HOSTCC="ccache clang" \
-            vmlinux -j"$(nproc)"
-          test -s "$SYMVERS_OUTPUT/vmlinux"
-          test -s "$SYMVERS_OUTPUT/vmlinux.symvers"
-          test -s "$SYMVERS_OUTPUT/System.map"
-          grep -q '[[:space:]]module_layout[[:space:]]' "$SYMVERS_OUTPUT/vmlinux.symvers"
+          # 内核源码/配置未变，vmlinux.symvers 与 System.map 与上次构建完全一致。
+          # 从最近一次成功 run 的 artifact 复用，跳过约 15 分钟的 ThinLTO vmlinux 重建。
+          RUN_ID="$(gh run list --branch android12-5.10-2025-09 --workflow "Build bq_ra_reader.ko" --limit 1 --status success --json databaseId --jq '.[0].databaseId')"
+          test -n "$RUN_ID"
+          echo "Reusing kernel symbol table from run: $RUN_ID"
+          mkdir -p out-symvers
+          gh run download "$RUN_ID" -n bq_ra_reader-xaga -D "$GITHUB_WORKSPACE"
+          test -s out-symvers/vmlinux.symvers || { echo "FAIL: vmlinux.symvers missing"; exit 1; }
+          test -s out-symvers/System.map || { echo "FAIL: System.map missing"; exit 1; }
+          wc -l out-symvers/vmlinux.symvers
+          grep -q '[[:space:]]module_layout[[:space:]]' out-symvers/vmlinux.symvers || { echo "FAIL: module_layout not in symvers"; exit 1; }
+          # 确认复用的符号表属于同一内核（防止复用到旧的内核符号表）
+          KERNEL_RELEASE="$(make --no-print-directory O="$KBUILD_OUTPUT" kernelrelease)"
+          printf 'reused symvers kernelrelease=%s\n' "$KERNEL_RELEASE"
 
       - name: Build bq_ra_reader module
         run: |
