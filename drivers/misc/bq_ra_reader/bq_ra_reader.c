@@ -32,9 +32,9 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define BQ_RA_ADDR		0x55
 #define BQ_RA_DRIVER_NAME	"bq28z610"
 #define BQ_RA_REG_ALT_MAC	0x3e
-#define BQ_RA_CMD		0x40c0
-#define BQ_RA_READ_LEN		36
-#define BQ_RA_DATA_LEN		32
+#define BQ_RA_CMD		0x00e0
+#define BQ_RA_READ_LEN		34
+#define BQ_RA_DATA_LEN		30
 
 static struct i2c_client *ra_client;
 static struct kobject *ra_kobj;
@@ -127,12 +127,12 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 
 	length = response[BQ_RA_READ_LEN - 1];
 
-	pr_info("bq_ra_reader: RA raw[0..35]:"
+	pr_info("bq_ra_reader: RA raw[0..33]:"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
-		" %02x %02x %02x %02x len=%u cksum=%02x calc=%02x\n",
+		" %02x %02x len=%u cksum=%02x calc=%02x\n",
 		response[0], response[1], response[2], response[3],
 		response[4], response[5], response[6], response[7],
 		response[8], response[9], response[10], response[11],
@@ -141,8 +141,8 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 		response[20], response[21], response[22], response[23],
 		response[24], response[25], response[26], response[27],
 		response[28], response[29], response[30], response[31],
-		response[32], response[33], response[34], response[35],
-		length, response[34], ra_checksum(response, length - 2));
+		response[32], response[33],
+		length, response[32], ra_checksum(response, length - 2));
 
 	if (length < 3 || length > BQ_RA_READ_LEN)
 		return -EBADMSG;
