@@ -122,13 +122,25 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 			return ret;
 	}
 
-	/* 与设备驱动 bq28z610.c 的 fg_mac_read_block() 一致：
-	 * - length 字节（response[35]）不强制等于 36（NFG1000B 定制版
-	 *   可能报告不同的块长度），只做 checksum 校验；
-	 * - checksum 在 response[34]，对 response[0..length-3] 求和；
-	 * - 数据区固定取 response[2..33] 共 32 字节。
-	 */
 	length = response[BQ_RA_READ_LEN - 1];
+
+	pr_info("bq_ra_reader: RA raw[0..35]:"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x len=%u cksum=%02x calc=%02x\n",
+		response[0], response[1], response[2], response[3],
+		response[4], response[5], response[6], response[7],
+		response[8], response[9], response[10], response[11],
+		response[12], response[13], response[14], response[15],
+		response[16], response[17], response[18], response[19],
+		response[20], response[21], response[22], response[23],
+		response[24], response[25], response[26], response[27],
+		response[28], response[29], response[30], response[31],
+		response[32], response[33], response[34], response[35],
+		length, response[34], ra_checksum(response, length - 2));
+
 	if (length < 3 || length > BQ_RA_READ_LEN)
 		return -EBADMSG;
 	if (ra_checksum(response, length - 2) != response[length - 2])
