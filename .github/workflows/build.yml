@@ -1,4 +1,4 @@
-name: Verify bq28z610.ko ABI
+name: Build bq_ra_reader.ko
 
 on:
   push:
@@ -33,6 +33,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: 确认 x86_64 交叉编译主机
+        run: |
+          test "$(uname -m)" = "x86_64"
+          echo "GitHub Actions host: $(uname -m)"
+          echo "Kernel target: ${ARCH}"
+
       - name: 安装编译依赖
         run: |
           sudo apt-get update
@@ -57,14 +63,14 @@ jobs:
 
       - name: Configure kernel
         run: |
-          test "$(grep -c '^CONFIG_MI_HARDWARE_ID=m$' arch/arm64/configs/gki_defconfig)" -eq 1
-          test "$(grep -c '^CONFIG_XMEXT_TI_GAUGE=m$' arch/arm64/configs/gki_defconfig)" -eq 1
           : > .scmversion
           test -f .scmversion
           make O="$KBUILD_OUTPUT" \
             CC="ccache clang" \
             HOSTCC="ccache clang" \
             gki_defconfig
+          # I2C_SMBUS must be built in so bq_ra_reader (depends on
+          # I2C && I2C_SMBUS && SYSFS) survives olddefconfig.
           printf '%s\n' 'CONFIG_I2C_SMBUS=y' >> "$KBUILD_OUTPUT/.config"
           printf '%s\n' 'CONFIG_BQ_RA_READER=m' >> "$KBUILD_OUTPUT/.config"
           sed -i \
@@ -86,8 +92,7 @@ jobs:
           ! grep -q '^CONFIG_LTO_CLANG_THIN=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_MODVERSIONS=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_CFI_CLANG=y$' "$KBUILD_OUTPUT/.config"
-          grep -q '^CONFIG_MI_HARDWARE_ID=m$' "$KBUILD_OUTPUT/.config"
-          grep -q '^CONFIG_XMEXT_TI_GAUGE=m$' "$KBUILD_OUTPUT/.config"
+          grep -q '^CONFIG_I2C_SMBUS=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_BQ_RA_READER=m$' "$KBUILD_OUTPUT/.config"
 
       - name: Build kernel symbol table with ThinLTO
@@ -128,19 +133,15 @@ jobs:
           test -s "$SYMVERS_OUTPUT/System.map"
           grep -q '[[:space:]]module_layout[[:space:]]' "$SYMVERS_OUTPUT/vmlinux.symvers"
 
-      - name: Build hwid and bq modules in one modpost
+      - name: Build bq_ra_reader module
         run: |
           make O="$KBUILD_OUTPUT" \
             KBUILD_MIXED_TREE="$GITHUB_WORKSPACE/out-symvers" \
             CC="ccache clang" \
             HOSTCC="ccache clang" \
-            drivers/misc/hwid/hwid.ko \
             drivers/misc/bq_ra_reader/bq_ra_reader.ko \
-            drivers/power/supply/bq28z610.ko \
             -j"$(nproc)"
-          test -s "$KBUILD_OUTPUT/drivers/misc/hwid/hwid.ko"
           test -s "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/bq_ra_reader.ko"
-          test -s "$KBUILD_OUTPUT/drivers/power/supply/bq28z610.ko"
           test -s "$KBUILD_OUTPUT/modules-only.symvers"
           cp "$GITHUB_WORKSPACE/out-symvers/vmlinux.symvers" \
             "$KBUILD_OUTPUT/vmlinux.symvers"
@@ -148,147 +149,22 @@ jobs:
             "$KBUILD_OUTPUT/modules-only.symvers" > "$KBUILD_OUTPUT/Module.symvers"
           test -s "$KBUILD_OUTPUT/Module.symvers"
 
-      - name: Verify module ABI and metadata
+      - name: Verify bq_ra_reader ABI and metadata
         env:
-          BQ: out/drivers/power/supply/bq28z610.ko
-          HWID: out/drivers/misc/hwid/hwid.ko
           RA: out/drivers/misc/bq_ra_reader/bq_ra_reader.ko
         run: |
           set -euo pipefail
 
-          llvm-readelf -h "$BQ" > bq.header.txt
-          llvm-readelf -h "$HWID" > hwid.header.txt
-          grep -q 'Class:.*ELF64' bq.header.txt
-          grep -q 'Machine:.*AArch64' bq.header.txt
-          grep -q 'Machine:.*AArch64' hwid.header.txt
-
-          llvm-readelf -p .modinfo "$BQ" > bq.modinfo.txt
-          llvm-readelf -p .modinfo "$HWID" > hwid.modinfo.txt
-          grep -q 'name=bq28z610' bq.modinfo.txt
-          grep -q 'name=hwid' hwid.modinfo.txt
-          grep -q 'depends=hwid' bq.modinfo.txt
           KERNEL_RELEASE="$(cat out/include/config/kernel.release)"
-          grep -Fq "vermagic=$KERNEL_RELEASE " bq.modinfo.txt
-          grep -Fq "vermagic=$KERNEL_RELEASE " hwid.modinfo.txt
-
-          # __versions must exist and contain records, not merely an empty section.
-          llvm-readelf -SW "$BQ" > bq.sections.txt
-          llvm-readelf -SW "$HWID" > hwid.sections.txt
-          BQ_VERSIONS_LINE="$(awk '$2 == "__versions" {print; exit}' bq.sections.txt)"
-          HWID_VERSIONS_LINE="$(awk '$2 == "__versions" {print; exit}' hwid.sections.txt)"
-          test -n "$BQ_VERSIONS_LINE"
-          test -n "$HWID_VERSIONS_LINE"
-          BQ_VERSIONS_SIZE="$(printf '%s\n' "$BQ_VERSIONS_LINE" | awk '{print $(NF-5)}')"
-          HWID_VERSIONS_SIZE="$(printf '%s\n' "$HWID_VERSIONS_LINE" | awk '{print $(NF-5)}')"
-          test "$BQ_VERSIONS_SIZE" != "000000"
-          test "$HWID_VERSIONS_SIZE" != "000000"
-          llvm-readelf -p __versions "$BQ" > bq.versions.txt
-          llvm-readelf -p __versions "$HWID" > hwid.versions.txt
-          grep -q 'module_layout' bq.versions.txt
-          grep -q 'get_hw_sku' bq.versions.txt
-          grep -q 'module_layout' hwid.versions.txt
-
-          # On arm64 each modversion record is 64 bytes: u64 CRC + 56-byte name.
-          llvm-objcopy --dump-section __versions=bq.versions.bin "$BQ"
-          python3 - <<'PY'
-          import struct
-          from pathlib import Path
-
-          data = Path('bq.versions.bin').read_bytes()
-          if len(data) == 0 or len(data) % 64:
-              raise SystemExit(f'invalid __versions size: {len(data)}')
-          records = {}
-          for offset in range(0, len(data), 64):
-              crc = struct.unpack_from('<Q', data, offset)[0] & 0xffffffff
-              name = data[offset + 8:offset + 64].split(b'\x00', 1)[0].decode()
-              if name:
-                  records[name] = crc
-          symvers = {}
-          for path in ('out/vmlinux.symvers', 'out/modules-only.symvers'):
-              for line in Path(path).read_text().splitlines():
-                  fields = line.split()
-                  if len(fields) >= 2:
-                      symvers[fields[1]] = int(fields[0], 16)
-          required = {
-              'module_layout': symvers.get('module_layout'),
-              'get_hw_sku': 0x8a6b6b4f,
-          }
-          for name, expected in required.items():
-              if name not in records:
-                  raise SystemExit(f'missing __versions record: {name}')
-              if expected is None:
-                  raise SystemExit(f'missing vmlinux.symvers record: {name}')
-              if records[name] != expected:
-                  raise SystemExit(
-                      f'{name} CRC {records[name]:08x} != {expected:08x}')
-          print('bq __versions:', ', '.join(
-              f'{name}={records[name]:08x}' for name in required))
-          PY
-
-          # get_hw_sku must be provided by hwid and consumed by bq.
-          # These are the CRCs required by the original vendor consumers.
-          llvm-nm -a "$BQ" > bq.nm.txt
-          llvm-nm -a "$HWID" > hwid.nm.txt
-          HWID_SKU_CRC="$(awk '$3 == "__crc_get_hw_sku" {print tolower($1); exit}' hwid.nm.txt)"
-          printf 'get_hw_sku module CRC=%s expected=%s\n' \
-            "$HWID_SKU_CRC" 000000008a6b6b4f
-          test "$HWID_SKU_CRC" = "000000008a6b6b4f"
-          awk '$2 == "get_hw_sku" {print}' out/modules-only.symvers > hwid.symvers.txt
-          test -s hwid.symvers.txt
-          cat hwid.symvers.txt
-          awk '$2 == "get_hw_sku" && tolower($1) == "0x8a6b6b4f" {found=1} END {exit !found}' \
-            out/modules-only.symvers
-
-          check_export_crc() {
-            local symbol="$1"
-            local expected="$2"
-            local actual
-            actual="$(awk -v symbol="__crc_$symbol" '$3 == symbol {print tolower($1); exit}' bq.nm.txt)"
-            printf '%s module CRC=%s expected=%s\n' "$symbol" "$actual" "$expected"
-            test "$actual" = "$expected"
-          }
-          check_export_crc bms_get_property 000000000f62fe56
-          check_export_crc bms_set_property 00000000ce2dc0be
-          check_export_crc bms_get_batt_sn 00000000da2e5d91
-
-          check_symvers_crc() {
-            local symbol="$1"
-            local expected="$2"
-            local actual
-            actual="$(awk -v symbol="$symbol" '$2 == symbol {print tolower($1); exit}' out/Module.symvers)"
-            printf '%s symvers CRC=%s expected=%s\n' "$symbol" "$actual" "$expected"
-            test "$actual" = "$expected"
-          }
-          check_symvers_crc bms_get_property 0x0f62fe56
-          check_symvers_crc bms_set_property 0xce2dc0be
-          check_symvers_crc bms_get_batt_sn 0xda2e5d91
-
-          grep -q '[[:space:]]bms_get_property$' bq.nm.txt
-          grep -q '[[:space:]]bms_set_property$' bq.nm.txt
-          grep -q '[[:space:]]bms_get_batt_sn$' bq.nm.txt
-
-          grep -q '^CONFIG_CFI_CLANG=y$' out/.config
-          if grep -q '^CONFIG_MODULE_SIG=y$' out/.config; then
-            echo 'module signature enforcement: enabled'
-            test -s out/signing_key.x509
-            grep -q '^CONFIG_MODULE_SIG_ALL=y$' out/.config
-            test -s out/scripts/sign-file
-          else
-            echo 'module signature enforcement: disabled'
-            ! grep -q '^CONFIG_MODULE_SIG_FORCE=y$' out/.config
-          fi
-          echo 'CFI entry points:'
-          awk '$3 ~ /^__cfi_(check|jt_start|jt_end)$/ {print}' bq.nm.txt
-          grep -q '[[:space:]]__cfi_check$' bq.nm.txt
-          grep -q '[[:space:]]__cfi_jt_start$' bq.nm.txt
-          grep -q '[[:space:]]__cfi_jt_end$' bq.nm.txt
 
           llvm-readelf -h "$RA" > ra.header.txt
           grep -q 'Class:.*ELF64' ra.header.txt
           grep -q 'Machine:.*AArch64' ra.header.txt
+
           llvm-readelf -p .modinfo "$RA" > ra.modinfo.txt
           grep -q 'name=bq_ra_reader' ra.modinfo.txt
           grep -Fq "vermagic=$KERNEL_RELEASE " ra.modinfo.txt
+
           llvm-readelf -SW "$RA" > ra.sections.txt
           RA_VERSIONS_LINE="$(awk '$2 == "__versions" {print; exit}' ra.sections.txt)"
           test -n "$RA_VERSIONS_LINE"
@@ -299,6 +175,7 @@ jobs:
           grep -q '__i2c_smbus_xfer' ra.versions.txt
           grep -q 'i2c_for_each_dev' ra.versions.txt
           grep -q 'i2c_verify_client' ra.versions.txt
+
           llvm-nm -a "$RA" > ra.nm.txt
           grep -q '[[:space:]]__cfi_check$' ra.nm.txt
           grep -q '[[:space:]]__cfi_jt_start$' ra.nm.txt
@@ -306,17 +183,16 @@ jobs:
           ! grep -q '[[:space:]]bms_get_batt_sn$' ra.nm.txt
           ! grep -q '[[:space:]]bms_get_property$' ra.nm.txt
           ! grep -q '[[:space:]]bms_set_property$' ra.nm.txt
-          echo 'ABI checks passed for bq28z610.ko, hwid.ko, and bq_ra_reader.ko.'
-          sha256sum "$BQ" "$HWID" "$RA"
 
-      - name: Upload verified modules
+          echo 'ABI checks passed for bq_ra_reader.ko.'
+          sha256sum "$RA"
+
+      - name: Upload bq_ra_reader module
         uses: actions/upload-artifact@v4
         with:
-          name: bq28z610-xaga-verified
+          name: bq_ra_reader-xaga
           if-no-files-found: error
           path: |
-            out/drivers/power/supply/bq28z610.ko
-            out/drivers/misc/hwid/hwid.ko
             out/drivers/misc/bq_ra_reader/bq_ra_reader.ko
             out/Module.symvers
             out/vmlinux.symvers
@@ -326,17 +202,6 @@ jobs:
             out-symvers/vmlinux.symvers
             out-symvers/System.map
             out-symvers/.config
-            bq.header.txt
-            hwid.header.txt
-            bq.modinfo.txt
-            hwid.modinfo.txt
-            bq.sections.txt
-            hwid.sections.txt
-            bq.versions.bin
-            bq.versions.txt
-            hwid.versions.txt
-            bq.nm.txt
-            hwid.nm.txt
             ra.header.txt
             ra.modinfo.txt
             ra.sections.txt
