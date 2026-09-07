@@ -157,6 +157,8 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 	}
 
 	length = response[BQ_RA_READ_LEN - 1];
+	if (length < 3 || length > BQ_RA_READ_LEN)
+		return -EBADMSG;
 
 	pr_info("bq_ra_reader: mac raw[0..35]:"
 		" %02x %02x %02x %02x %02x %02x %02x %02x"
@@ -175,9 +177,10 @@ static int ra_read_block(const struct i2c_client *client, u8 *data)
 		response[32], response[33], response[34], response[35],
 		length, response[34], ra_checksum(response, length - 2));
 
-	if (length < 3 || length > BQ_RA_READ_LEN)
-		return -EBADMSG;
-	if (ra_checksum(response, length - 2) != response[length - 2])
+	/* The gauge keeps checksum at response[34], while length at response[35]
+	 * tells how many leading bytes participate in the checksum calculation.
+	 * This matches the official fg_mac_read_block() implementation. */
+	if (ra_checksum(response, length - 2) != response[34])
 		return -EBADMSG;
 
 	memcpy(data, &response[2], BQ_RA_DATA_LEN);
