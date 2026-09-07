@@ -235,7 +235,7 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 }
 
 /* Caller must hold ra_lock. */
-static int ra_read_client_command_locked(const struct i2c_client *client,
+static int ra_read_client_command_locked(struct i2c_client *client,
 					 u16 cmd, u8 *data, u8 data_len)
 {
 	int ret;
@@ -464,7 +464,8 @@ static ssize_t ra_comp_res_show(struct kobject *kobj,
 }
 
 static struct kobj_attribute ra_table_attr = __ATTR_RO(ra_table);
-static struct kobj_attribute ra_comp_res_attr = __ATTR_RO(comp_res);
+static struct kobj_attribute ra_comp_res_attr =
+	__ATTR(comp_res, 0444, ra_comp_res_show, NULL);
 
 static int __init bq_ra_reader_init(void)
 {
