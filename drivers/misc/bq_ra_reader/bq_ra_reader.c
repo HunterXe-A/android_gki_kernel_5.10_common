@@ -45,23 +45,28 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
  * 状态数据 4 字节。保留完整 32 位状态才能表示 RX(bit18)。
  */
 #define BQ_RA_GAUGING_DATA_LEN		4
-#define BQ_RA_IT_STATUS1_DATA_LEN	20
-#define BQ_RA_COMP_RES_OFFSET		18
+#define BQ_RA_IT_STATUS1_DATA_LEN	24
+#define BQ_RA_IT_TRUE_REM_Q_OFFSET	0
+#define BQ_RA_IT_TRUE_REM_E_OFFSET	2
+#define BQ_RA_IT_INITIAL_Q_OFFSET	4
+#define BQ_RA_IT_INITIAL_E_OFFSET	6
+#define BQ_RA_IT_TRUE_FULL_CHG_Q_OFFSET	8
+#define BQ_RA_IT_TRUE_FULL_CHG_E_OFFSET	10
+#define BQ_RA_IT_T_SIM_OFFSET		12
+#define BQ_RA_IT_T_AMBIENT_OFFSET	14
+#define BQ_RA_IT_RA_SCALE0_OFFSET	16
+#define BQ_RA_IT_RA_SCALE1_OFFSET	18
+#define BQ_RA_IT_COMP_RES1_OFFSET	20
+#define BQ_RA_IT_COMP_RES2_OFFSET	22
 #define BQ_RA_MIN_POLL_INTERVAL_MS	100U
 
 /* 可在 insmod 时设置，也可通过 /sys/module/bq_ra_reader/parameters/ 修改。 */
 static unsigned int poll_interval_ms = 5000;
 module_param(poll_interval_ms, uint, 0644);
 MODULE_PARM_DESC(poll_interval_ms,
-	"GaugingStatus polling interval in milliseconds (minimum 100)");
+	"ITStatus1 polling interval in milliseconds (minimum 100)");
 
-/*
- * GaugingStatus() 关键位。
- *
- * 这些位号按当前 BQ28Z610 实测协议使用：RX 位位于 32 位状态的 bit18，
- * 因此不能再用 u16 保存状态。RX 翻转是一次 Ra/CompRes 更新事件的触发
- * 条件；VOK、REST、DSG 作为事件发生时的上下文一起保存。
- */
+/* GaugingStatus() 关键位，仅用于诊断展示，不参与 CompRes 捕获触发。 */
 #define GAUGING_STATUS_R_DIS	BIT(10)
 #define GAUGING_STATUS_VOK	BIT(11)
 #define GAUGING_STATUS_RX	BIT(18)
@@ -75,16 +80,21 @@ static struct delayed_work ra_poll_work;
 
 /* All fields below are protected by ra_lock. */
 static bool ra_stopping;
-static bool ra_rx_valid;
-static u32 ra_rx_last;
 static u32 ra_last_gauging_status;
+static bool ra_it_baseline_valid;
+static s16 ra_it_last_comp_res1;
+static s16 ra_it_last_comp_res2;
 static bool ra_have_comp_res;
-static u16 ra_comp_res_raw;
-static u32 ra_comp_res_mohm_x10;
+static s16 ra_comp_res1_raw;
+static s16 ra_comp_res2_raw;
+static s16 ra_comp_ra_scale0;
+static s16 ra_comp_ra_scale1;
+static bool ra_comp_cell1_valid;
+static bool ra_comp_cell2_valid;
+static s32 ra_comp_cell1_mohm_x10;
+static s32 ra_comp_cell2_mohm_x10;
 static u32 ra_comp_capture_count;
 static unsigned long ra_comp_timestamp;
-static u32 ra_comp_gauging_status;
-static bool ra_comp_context_vok_rest;
 
 struct ra_find_context {
 	struct i2c_client *client;
@@ -155,10 +165,39 @@ static unsigned long ra_poll_delay(void)
 	return msecs_to_jiffies(ra_effective_poll_interval_ms());
 }
 
-/* Return tenths of a milliohm: raw * 1000 / 1024 milliohm, x10 fixed point. */
-static u32 ra_comp_res_to_mohm_x10(u16 raw)
+static u16 ra_le16(const u8 *data, unsigned int offset)
 {
-	return ((u32)raw * 1000U * 10U) / 1024U;
+	return (u16)data[offset] | ((u16)data[offset + 1] << 8);
+}
+
+static s16 ra_sle16(const u8 *data, unsigned int offset)
+{
+	return (s16)ra_le16(data, offset);
+}
+
+/*
+ * 返回 x10 毫欧值：raw / scale * 1000 / 1024 * 10。
+ * 先乘 10000，再除以 scale*1024，保留一位小数；s64 同时保证
+ * 中间结果和负值都不会溢出。scale 为 0 时返回 false，表示不可用。
+ */
+static bool ra_comp_res_to_mohm_x10(s16 raw, u16 scale, s32 *result)
+{
+	s64 numerator;
+	s64 denominator;
+
+	if (!scale || !result)
+		return false;
+
+	numerator = (s64)raw * 10000;
+	denominator = (s64)scale * 1024;
+	*result = (s32)(numerator / denominator);
+	return true;
+}
+
+static bool ra_is_single_cell_hint(s16 scale0, s16 scale1)
+{
+	/* 两个 scale 都为正且 scale1 小于 scale0 的十分之一时，提示 Cell2 可能是占位字段。 */
+	return scale0 > 0 && scale1 >= 0 && scale1 < scale0 / 10;
 }
 
 /*
@@ -260,35 +299,64 @@ static int ra_read_client_command_locked(struct i2c_client *client,
 	return ret;
 }
 
-static int ra_prime_rx_baseline_locked(void)
+static int ra_read_gauging_status_locked(void)
 {
 	u8 data[BQ_RA_GAUGING_DATA_LEN];
-	u32 status;
 	int ret;
 
 	ret = ra_read_client_command_locked(ra_client,
 		BQ_RA_CMD_GAUGING_STATUS, data, sizeof(data));
-	if (ret)
-		return ret;
+	if (!ret)
+		ra_last_gauging_status = ra_status_value(data);
+	return ret;
+}
 
-	status = ra_status_value(data);
-	ra_last_gauging_status = status;
-	ra_rx_last = status & GAUGING_STATUS_RX;
-	ra_rx_valid = true;
-	pr_info("bq_ra_reader: RX baseline=0x%08x GaugingStatus=0x%08x\n",
-		ra_rx_last, status);
-	return 0;
+struct ra_it_status1 {
+	s16 true_rem_q;
+	s16 true_rem_e;
+	s16 initial_q;
+	s16 initial_e;
+	s16 true_full_chg_q;
+	s16 true_full_chg_e;
+	u16 t_sim;
+	u16 t_ambient;
+	s16 ra_scale0;
+	s16 ra_scale1;
+	s16 comp_res1;
+	s16 comp_res2;
+};
+
+static void ra_parse_it_status1(const u8 *data, struct ra_it_status1 *status)
+{
+	status->true_rem_q = ra_sle16(data, BQ_RA_IT_TRUE_REM_Q_OFFSET);
+	status->true_rem_e = ra_sle16(data, BQ_RA_IT_TRUE_REM_E_OFFSET);
+	status->initial_q = ra_sle16(data, BQ_RA_IT_INITIAL_Q_OFFSET);
+	status->initial_e = ra_sle16(data, BQ_RA_IT_INITIAL_E_OFFSET);
+	status->true_full_chg_q = ra_sle16(data, BQ_RA_IT_TRUE_FULL_CHG_Q_OFFSET);
+	status->true_full_chg_e = ra_sle16(data, BQ_RA_IT_TRUE_FULL_CHG_E_OFFSET);
+	status->t_sim = ra_le16(data, BQ_RA_IT_T_SIM_OFFSET);
+	status->t_ambient = ra_le16(data, BQ_RA_IT_T_AMBIENT_OFFSET);
+	status->ra_scale0 = ra_sle16(data, BQ_RA_IT_RA_SCALE0_OFFSET);
+	status->ra_scale1 = ra_sle16(data, BQ_RA_IT_RA_SCALE1_OFFSET);
+	status->comp_res1 = ra_sle16(data, BQ_RA_IT_COMP_RES1_OFFSET);
+	status->comp_res2 = ra_sle16(data, BQ_RA_IT_COMP_RES2_OFFSET);
 }
 
 static void ra_poll_workfn(struct work_struct *work)
 {
-	u8 gauging_data[BQ_RA_GAUGING_DATA_LEN];
 	u8 it_status_data[BQ_RA_IT_STATUS1_DATA_LEN];
-	u32 status;
-	u32 rx_now;
-	u16 comp_res;
-	bool rx_changed;
-	bool context_vok_rest;
+	struct ra_it_status1 it_status;
+	s16 comp_res1;
+	s16 comp_res2;
+	s16 scale0_raw;
+	s16 scale1_raw;
+	u16 scale0;
+	u16 scale1;
+	s32 cell1_mohm_x10;
+	s32 cell2_mohm_x10;
+	bool cell1_valid;
+	bool cell2_valid;
+	bool changed;
 	int ret;
 
 	(void)work;
@@ -296,61 +364,60 @@ static void ra_poll_workfn(struct work_struct *work)
 	if (ra_stopping || !ra_client)
 		goto reschedule;
 
-	ret = ra_read_client_command_locked(ra_client,
-		BQ_RA_CMD_GAUGING_STATUS, gauging_data, sizeof(gauging_data));
-	if (ret) {
+	/* GaugingStatus remains a diagnostic snapshot and is not an event gate. */
+	ret = ra_read_gauging_status_locked();
+	if (ret)
 		pr_err_ratelimited("bq_ra_reader: GaugingStatus poll failed: %d\n",
 			ret);
-		goto reschedule;
-	}
 
-	status = ra_status_value(gauging_data);
-	ra_last_gauging_status = status;
-	rx_now = status & GAUGING_STATUS_RX;
-	if (!ra_rx_valid) {
-		/* A failed startup read has no baseline; the first good poll only
-		 * establishes one and must not be reported as an update event. */
-		ra_rx_last = rx_now;
-		ra_rx_valid = true;
-		goto reschedule;
-	}
-
-	rx_changed = rx_now != ra_rx_last;
-	if (!rx_changed)
-		goto reschedule;
-
-	/* RX is the event edge. VOK and REST explain the event context, but are
-	 * not used as a gate: they can clear before this periodic sample arrives.
-	 * Rejecting the edge here could lose a real CompRes update permanently. */
-	context_vok_rest = !!(status & GAUGING_STATUS_VOK) &&
-		!!(status & GAUGING_STATUS_REST);
-	ret = ra_read_client_command_locked(ra_client,
-		BQ_RA_CMD_IT_STATUS1, it_status_data, sizeof(it_status_data));
+	ret = ra_read_client_command_locked(ra_client, BQ_RA_CMD_IT_STATUS1,
+		it_status_data, sizeof(it_status_data));
 	if (ret) {
-		pr_err_ratelimited("bq_ra_reader: ITStatus1 read after RX change failed: %d\n",
-			ret);
-		/* Keep the old baseline so the same edge is retried next poll. */
+		pr_err_ratelimited("bq_ra_reader: ITStatus1 poll failed: %d\n", ret);
 		goto reschedule;
 	}
 
-	comp_res = (u16)it_status_data[BQ_RA_COMP_RES_OFFSET] |
-		((u16)it_status_data[BQ_RA_COMP_RES_OFFSET + 1] << 8);
-	ra_rx_last = rx_now;
-	ra_comp_res_raw = comp_res;
-	ra_comp_res_mohm_x10 = ra_comp_res_to_mohm_x10(comp_res);
-	ra_comp_capture_count++;
+	ra_parse_it_status1(it_status_data, &it_status);
+	comp_res1 = it_status.comp_res1;
+	comp_res2 = it_status.comp_res2;
+	scale0_raw = it_status.ra_scale0;
+	scale1_raw = it_status.ra_scale1;
+	scale0 = scale0_raw > 0 ? scale0_raw : 0;
+	scale1 = scale1_raw > 0 ? scale1_raw : 0;
+	if (!ra_it_baseline_valid) {
+		ra_it_last_comp_res1 = comp_res1;
+		ra_it_last_comp_res2 = comp_res2;
+		ra_it_baseline_valid = true;
+		goto reschedule;
+	}
+
+	changed = comp_res1 != ra_it_last_comp_res1 ||
+		comp_res2 != ra_it_last_comp_res2;
+	ra_it_last_comp_res1 = comp_res1;
+	ra_it_last_comp_res2 = comp_res2;
+	if (!changed)
+		goto reschedule;
+
+	cell1_valid = ra_comp_res_to_mohm_x10(comp_res1, scale0,
+		&cell1_mohm_x10);
+	cell2_valid = ra_comp_res_to_mohm_x10(comp_res2, scale1,
+		&cell2_mohm_x10);
+	ra_comp_res1_raw = comp_res1;
+	ra_comp_res2_raw = comp_res2;
+	ra_comp_ra_scale0 = scale0;
+	ra_comp_ra_scale1 = scale1;
+	ra_comp_cell1_valid = cell1_valid;
+	ra_comp_cell2_valid = cell2_valid;
+	ra_comp_cell1_mohm_x10 = cell1_mohm_x10;
+	ra_comp_cell2_mohm_x10 = cell2_mohm_x10;
 	ra_comp_timestamp = jiffies;
-	ra_comp_gauging_status = status;
-	ra_comp_context_vok_rest = context_vok_rest;
+	ra_comp_capture_count++;
 	ra_have_comp_res = true;
-	pr_info("bq_ra_reader: captured CompRes raw=%u mOhm=%u.%u "
-		"status=0x%08x VOK=%u REST=%u DSG=%u context_vok_rest=%u count=%u\n",
-		comp_res, ra_comp_res_mohm_x10 / 10,
-		ra_comp_res_mohm_x10 % 10, status,
-		!!(status & GAUGING_STATUS_VOK),
-		!!(status & GAUGING_STATUS_REST),
-		!!(status & GAUGING_STATUS_DSG),
-		context_vok_rest, ra_comp_capture_count);
+	pr_info("bq_ra_reader: ITStatus1 changed comp_res1=%d scale0=%u "
+		"comp_res2=%d scale1=%u cell1=%s cell2=%s count=%u\n",
+		comp_res1, scale0, comp_res2, scale1,
+		cell1_valid ? "valid" : "n/a",
+		cell2_valid ? "valid" : "n/a", ra_comp_capture_count);
 
 reschedule:
 	if (!ra_stopping)
@@ -412,11 +479,25 @@ out_unlock:
 	return len;
 }
 
+static int ra_format_mohm(char *buf, size_t size, bool valid, s32 value)
+{
+	s64 magnitude;
+
+	if (!valid)
+		return scnprintf(buf, size, "n/a");
+	magnitude = value < 0 ? -(s64)value : value;
+	return scnprintf(buf, size, "%s%lld.%lld", value < 0 ? "-" : "",
+		magnitude / 10, magnitude % 10);
+}
+
 static ssize_t ra_comp_res_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
+	char cell1_mohm[32];
+	char cell2_mohm[32];
 	unsigned int interval_ms;
 	unsigned int effective_ms;
+	bool single_cell_hint;
 	ssize_t len;
 
 	mutex_lock(&ra_lock);
@@ -428,36 +509,36 @@ static ssize_t ra_comp_res_show(struct kobject *kobj,
 			"message=valid_comp_res_update_not_captured\n"
 			"poll_interval_ms=%u\n"
 			"poll_interval_effective_ms=%u\n"
-			"rx_baseline_valid=%u\n"
 			"last_gauging_status=0x%08x\n"
 			"capture_count=0\n",
-			interval_ms, effective_ms, ra_rx_valid,
-			ra_last_gauging_status);
+			interval_ms, effective_ms, ra_last_gauging_status);
 	} else {
+		ra_format_mohm(cell1_mohm, sizeof(cell1_mohm),
+			ra_comp_cell1_valid, ra_comp_cell1_mohm_x10);
+		ra_format_mohm(cell2_mohm, sizeof(cell2_mohm),
+			ra_comp_cell2_valid, ra_comp_cell2_mohm_x10);
+		single_cell_hint = ra_is_single_cell_hint(ra_comp_ra_scale0,
+			ra_comp_ra_scale1);
 		len = sysfs_emit(buf,
 			"status=valid\n"
-			"comp_res_raw=%u\n"
-			"comp_res_mohm_x10=%u\n"
-			"comp_res_mohm=%u.%u\n"
+			"comp_res1_raw=%d\n"
+			"comp_res2_raw=%d\n"
+			"ra_scale0=%u\n"
+			"ra_scale1=%u\n"
+			"cell1_mohm=%s\n"
+			"cell2_mohm=%s\n"
 			"capture_timestamp_jiffies=%lu\n"
 			"capture_count=%u\n"
-			"capture_gauging_status=0x%08x\n"
-			"capture_R_DIS=%u capture_VOK=%u capture_RX=%u "
-			"capture_REST=%u capture_DSG=%u\n"
-			"capture_VOK_REST=%u\n"
+			"cell2_note=%s\n"
 			"poll_interval_ms=%u\n"
 			"poll_interval_effective_ms=%u\n",
-			ra_comp_res_raw, ra_comp_res_mohm_x10,
-			ra_comp_res_mohm_x10 / 10,
-			ra_comp_res_mohm_x10 % 10,
-			ra_comp_timestamp, ra_comp_capture_count,
-			ra_comp_gauging_status,
-			!!(ra_comp_gauging_status & GAUGING_STATUS_R_DIS),
-			!!(ra_comp_gauging_status & GAUGING_STATUS_VOK),
-			!!(ra_comp_gauging_status & GAUGING_STATUS_RX),
-			!!(ra_comp_gauging_status & GAUGING_STATUS_REST),
-			!!(ra_comp_gauging_status & GAUGING_STATUS_DSG),
-			ra_comp_context_vok_rest, interval_ms, effective_ms);
+			ra_comp_res1_raw, ra_comp_res2_raw,
+			ra_comp_ra_scale0, ra_comp_ra_scale1,
+			cell1_mohm, cell2_mohm, ra_comp_timestamp,
+			ra_comp_capture_count,
+			single_cell_hint ? "Cell2 may be unused on a single-cell design" :
+				"Cell2 scale is not in the single-cell hint range",
+			interval_ms, effective_ms);
 	}
 	mutex_unlock(&ra_lock);
 	return len;
@@ -481,11 +562,11 @@ static int __init bq_ra_reader_init(void)
 
 	ra_client = context.client;
 	mutex_lock(&ra_lock);
-	ret = ra_prime_rx_baseline_locked();
+	ret = ra_read_gauging_status_locked();
 	mutex_unlock(&ra_lock);
 	if (ret)
 		pr_warn("bq_ra_reader: initial GaugingStatus read failed: %d; "
-			"first successful poll will establish RX baseline\n", ret);
+			"polling will retry the diagnostic snapshot\n", ret);
 
 	ra_kobj = kobject_create_and_add("bq_ra_reader", kernel_kobj);
 	if (!ra_kobj) {
@@ -545,5 +626,5 @@ static void __exit bq_ra_reader_exit(void)
 module_init(bq_ra_reader_init);
 module_exit(bq_ra_reader_exit);
 
-MODULE_DESCRIPTION("BQ28Z610 GaugingStatus RX-linked CompRes probe");
+MODULE_DESCRIPTION("BQ28Z610 ITStatus1 CompRes change probe");
 MODULE_LICENSE("GPL v2");
