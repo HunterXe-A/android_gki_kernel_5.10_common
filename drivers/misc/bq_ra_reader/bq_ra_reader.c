@@ -38,6 +38,12 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define BQ_RA_CMD_GAUGING_STATUS	0x0056
 #define BQ_RA_CMD_IT_STATUS1		0x0073
 #define BQ_RA_CMD_IT_STATUS2		0x0074
+#define BQ_RA_CMD_DEVICE_TYPE		0x0001
+#define BQ_RA_CMD_FIRMWARE_VERSION	0x0002
+#define BQ_RA_CMD_HARDWARE_VERSION	0x0003
+#define BQ_RA_CMD_CHEM_ID		0x0006
+#define BQ_RA_CMD_OPERATION_STATUS	0x0054
+#define BQ_RA_CMD_MANUFACTURING_STATUS	0x0057
 #define BQ_RA_READ_LEN			36
 
 /*
@@ -156,6 +162,26 @@ struct ra_df_table {
 
 static struct ra_df_table ra_table_a0;
 
+struct ra_diag_command {
+	u16 cmd;
+	const char *name;
+};
+
+struct ra_diag_result {
+	int ret;
+	bool raw_valid;
+	u8 raw[BQ_RA_READ_LEN];
+};
+
+static const struct ra_diag_command ra_diag_commands[] = {
+	{ BQ_RA_CMD_DEVICE_TYPE, "device_type" },
+	{ BQ_RA_CMD_FIRMWARE_VERSION, "firmware_version" },
+	{ BQ_RA_CMD_HARDWARE_VERSION, "hardware_version" },
+	{ BQ_RA_CMD_CHEM_ID, "chem_id" },
+	{ BQ_RA_CMD_OPERATION_STATUS, "operation_status" },
+	{ BQ_RA_CMD_MANUFACTURING_STATUS, "manufacturing_status" },
+};
+
 struct ra_find_context {
 	struct i2c_client *client;
 };
@@ -260,14 +286,28 @@ static bool ra_is_single_cell_hint(s16 scale0, s16 scale1)
 	return scale0 > 0 && scale1 >= 0 && scale1 < scale0 / 10;
 }
 
+static void ra_log_mac_raw(u16 cmd, const u8 *response)
+{
+	char hex[BQ_RA_READ_LEN * 3 + 1];
+	int len = 0;
+	int i;
+
+	for (i = 0; i < BQ_RA_READ_LEN; i++)
+		len += scnprintf(hex + len, sizeof(hex) - len, "%s%02x",
+			i ? " " : "", response[i]);
+	pr_info("bq_ra_reader: diag cmd=0x%04x raw[0..35]: %s\n", cmd, hex);
+}
+
 /*
  * Execute one MAC read while the caller holds ra_lock. The gauge keeps the
  * checksum byte at response[34] and the length at response[35]; length-2 is
  * the number of leading bytes covered by the checksum, matching the official
  * fg_mac_read_block() implementation.
  */
-static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
-			     u8 *data, u8 data_len)
+static int ra_read_mac_block_ex(const struct i2c_client *client, u16 cmd,
+				     u8 *data, u8 data_len,
+				     u8 *raw_response, bool *raw_valid,
+				     bool strict_data_len)
 {
 	u8 response[BQ_RA_READ_LEN];
 	u8 value;
@@ -276,7 +316,10 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 	int ret;
 	int i;
 
-	if (!data || !data_len || data_len > BQ_RA_READ_LEN - 4)
+	if (raw_valid)
+		*raw_valid = false;
+	if ((!data && !raw_response) || data_len > BQ_RA_READ_LEN - 4 ||
+		(strict_data_len && (!data || !data_len)))
 		return -EINVAL;
 
 	value = cmd & 0xff;
@@ -300,6 +343,14 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 	}
 
 	length = response[BQ_RA_READ_LEN - 1];
+	if (raw_response)
+		memcpy(raw_response, response, BQ_RA_READ_LEN);
+	if (raw_valid)
+		*raw_valid = true;
+	if (!strict_data_len) {
+		ra_log_mac_raw(cmd, response);
+		return 0;
+	}
 	if (length < 3 || length > BQ_RA_READ_LEN ||
 		length < data_len + 4) {
 		pr_err_ratelimited("bq_ra_reader: invalid MAC response cmd=0x%04x len=%u data_len=%u\n",
@@ -329,13 +380,23 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 	if (checksum != response[34])
 		return -EBADMSG;
 
-	memcpy(data, &response[2], data_len);
+	if (data && data_len)
+		memcpy(data, &response[2], data_len);
 	return 0;
 }
 
+static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
+				     u8 *data, u8 data_len)
+{
+	return ra_read_mac_block_ex(client, cmd, data, data_len, NULL, NULL,
+		true);
+}
+
 /* Caller must hold ra_lock. */
-static int ra_read_client_command_locked(struct i2c_client *client,
-					 u16 cmd, u8 *data, u8 data_len)
+static int ra_read_client_command_raw_locked(struct i2c_client *client,
+					      u16 cmd, u8 *data, u8 data_len,
+					      u8 *raw_response, bool *raw_valid,
+					      bool strict_data_len)
 {
 	int ret;
 
@@ -352,11 +413,23 @@ static int ra_read_client_command_locked(struct i2c_client *client,
 
 	/* Hold the bus across the complete MAC command/read sequence. */
 	i2c_lock_bus(client->adapter, I2C_LOCK_SEGMENT);
-	ret = ra_read_mac_block(client, cmd, data, data_len);
+	if (!raw_response && !raw_valid && strict_data_len)
+		ret = ra_read_mac_block(client, cmd, data, data_len);
+	else
+		ret = ra_read_mac_block_ex(client, cmd, data, data_len,
+			raw_response, raw_valid, strict_data_len);
 	i2c_unlock_bus(client->adapter, I2C_LOCK_SEGMENT);
 	device_unlock(&client->dev);
 
 	return ret;
+}
+
+/* Caller must hold ra_lock. */
+static int ra_read_client_command_locked(struct i2c_client *client,
+					 u16 cmd, u8 *data, u8 data_len)
+{
+	return ra_read_client_command_raw_locked(client, cmd, data, data_len,
+		NULL, NULL, true);
 }
 
 /*
@@ -472,6 +545,18 @@ static int ra_read_data_flash_locked(struct i2c_client *client, u16 df_addr,
 	table->valid = true;
 	table->last_error = 0;
 	return 0;
+}
+
+static int ra_read_diag_command_locked(struct i2c_client *client, u16 cmd,
+				       struct ra_diag_result *result)
+{
+	if (!client || !result)
+		return -EINVAL;
+
+	memset(result, 0, sizeof(*result));
+	result->ret = ra_read_client_command_raw_locked(client, cmd, NULL, 0,
+		result->raw, &result->raw_valid, false);
+	return result->ret;
 }
 
 /* Caller must hold ra_lock. */
@@ -811,6 +896,88 @@ static ssize_t ra_it_status2_show(struct kobject *kobj,
 
 static int ra_format_mohm(char *buf, size_t size, bool valid, s32 value);
 
+static int ra_diag_emit_raw(char *buf, int len, const u8 *raw)
+{
+	int i;
+
+	len += sysfs_emit_at(buf, len, "raw_response[0..35]=");
+	for (i = 0; i < BQ_RA_READ_LEN; i++)
+		len += sysfs_emit_at(buf, len, "%s%02x", i ? " " : "", raw[i]);
+	len += sysfs_emit_at(buf, len, "\n");
+	len += sysfs_emit_at(buf, len, "command_echo=%02x %02x\n",
+		raw[0], raw[1]);
+	len += sysfs_emit_at(buf, len, "response_checksum_byte=%02x\n",
+		raw[34]);
+	len += sysfs_emit_at(buf, len, "response_length_byte=%u\n", raw[35]);
+	return len;
+}
+
+/*
+ * OperationStatus 的 SEC1/SEC0/PF 位位置待确认，需要对照官方文档核实；
+ * 核实，避免把不确定的 bit 编号误报成密封状态。当前只展示完整原始帧。
+ */
+static int ra_diag_emit_known_note(char *buf, int len, u16 cmd)
+{
+	if (cmd == BQ_RA_CMD_OPERATION_STATUS)
+		len += sysfs_emit_at(buf, len,
+			"security_bits=not_decoded\n"
+			"security_bits_note=SEC1_SEC0_PF_positions_pending_official_documentation\n");
+	else if (cmd == BQ_RA_CMD_MANUFACTURING_STATUS)
+		len += sysfs_emit_at(buf, len,
+			"manufacturing_fields=raw_only_pending_official_documentation\n");
+	return len;
+}
+
+static ssize_t ra_diag_info_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct ra_diag_result results[ARRAY_SIZE(ra_diag_commands)];
+	struct i2c_client *client;
+	int len = 0;
+	int ret;
+	unsigned int i;
+
+	mutex_lock(&ra_lock);
+	client = ra_client;
+	for (i = 0; i < ARRAY_SIZE(ra_diag_commands); i++) {
+		if (!client) {
+			memset(&results[i], 0, sizeof(results[i]));
+			results[i].ret = -ENODEV;
+			continue;
+		}
+		ra_read_diag_command_locked(client, ra_diag_commands[i].cmd,
+			&results[i]);
+	}
+	mutex_unlock(&ra_lock);
+
+	len += sysfs_emit_at(buf, len,
+		"diagnostic_snapshot=read_only_mac_commands\n"
+		"warning=no_seal_unseal_or_data_flash_write_is_performed\n");
+	for (i = 0; i < ARRAY_SIZE(ra_diag_commands); i++) {
+		const struct ra_diag_command *command = &ra_diag_commands[i];
+		const struct ra_diag_result *result = &results[i];
+
+		len += sysfs_emit_at(buf, len, "\n[%s]\ncommand=0x%04x\n",
+			command->name, command->cmd);
+		if (result->ret) {
+			len += sysfs_emit_at(buf, len,
+				"status=error\nread_error=%d\n", result->ret);
+			continue;
+		}
+		if (!result->raw_valid) {
+			len += sysfs_emit_at(buf, len,
+				"status=error\nread_error=-EBADMSG\n");
+			continue;
+		}
+		len += sysfs_emit_at(buf, len, "status=valid\n");
+		len = ra_diag_emit_raw(buf, len, result->raw);
+		len = ra_diag_emit_known_note(buf, len, command->cmd);
+	}
+
+	ret = len;
+	return ret;
+}
+
 static ssize_t ra_table_a0_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -955,6 +1122,8 @@ static struct kobj_attribute ra_it_status2_attr =
 	__ATTR(it_status2, 0444, ra_it_status2_show, NULL);
 static struct kobj_attribute ra_table_a0_attr =
 	__ATTR(ra_table_a0, 0444, ra_table_a0_show, NULL);
+static struct kobj_attribute ra_diag_info_attr =
+	__ATTR(diag_info, 0444, ra_diag_info_show, NULL);
 
 static int __init bq_ra_reader_init(void)
 {
@@ -1002,12 +1171,18 @@ static int __init bq_ra_reader_init(void)
 	if (ret)
 		goto remove_it_status2;
 
+	ret = sysfs_create_file(ra_kobj, &ra_diag_info_attr.attr);
+	if (ret)
+		goto remove_table_a0;
+
 	pr_info("bq_ra_reader: ready for %s-%04x, poll_interval=%ums\n",
 		dev_name(&ra_client->adapter->dev), ra_client->addr,
 		ra_effective_poll_interval_ms());
 	schedule_delayed_work(&ra_poll_work, ra_poll_delay());
 	return 0;
 
+remove_table_a0:
+	sysfs_remove_file(ra_kobj, &ra_table_a0_attr.attr);
 remove_it_status2:
 	sysfs_remove_file(ra_kobj, &ra_it_status2_attr.attr);
 remove_comp_res:
@@ -1033,6 +1208,7 @@ static void __exit bq_ra_reader_exit(void)
 	cancel_delayed_work_sync(&ra_poll_work);
 
 	if (ra_kobj) {
+		sysfs_remove_file(ra_kobj, &ra_diag_info_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_table_a0_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_it_status2_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_comp_res_attr.attr);
@@ -1052,5 +1228,5 @@ static void __exit bq_ra_reader_exit(void)
 module_init(bq_ra_reader_init);
 module_exit(bq_ra_reader_exit);
 
-MODULE_DESCRIPTION("BQ28Z610 ITStatus and Data Flash Ra Table probe");
+MODULE_DESCRIPTION("BQ28Z610 ITStatus, Ra Table and seal diagnostics");
 MODULE_LICENSE("GPL v2");
