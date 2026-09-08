@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Read MAC (AltManufacturerAccess) commands from NFG1000B/BQ28Z610
- * without replacing its driver. Probe mode: GaugingStatus + CompRes capture. */
+ * without replacing its driver. Probe mode: GaugingStatus + ITStatus1/2. */
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/i2c-smbus.h>
@@ -37,7 +37,21 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define BQ_RA_REG_ALT_MAC		0x3e
 #define BQ_RA_CMD_GAUGING_STATUS	0x0056
 #define BQ_RA_CMD_IT_STATUS1		0x0073
+#define BQ_RA_CMD_IT_STATUS2		0x0074
 #define BQ_RA_READ_LEN			36
+
+/* ITStatus2 response[2..5]: Pack Grid, LStatus, Cell Grid1, Cell Grid2. */
+#define BQ_RA_IT_STATUS2_DATA_LEN	4
+#define BQ_RA_IT_STATUS2_PACK_GRID_OFFSET	0
+#define BQ_RA_IT_STATUS2_LSTATUS_OFFSET	1
+#define BQ_RA_IT_STATUS2_CELL_GRID1_OFFSET	2
+#define BQ_RA_IT_STATUS2_CELL_GRID2_OFFSET	3
+
+/* LStatus: bit3=QMax, bit2=ITEN, bit1=CF1, bit0=CF0. */
+#define IT_STATUS2_LSTATUS_CF0		BIT(0)
+#define IT_STATUS2_LSTATUS_CF1		BIT(1)
+#define IT_STATUS2_LSTATUS_ITEN		BIT(2)
+#define IT_STATUS2_LSTATUS_QMAX		BIT(3)
 
 /*
  * GaugingStatus() 的实测响应是 response[2..5] 四字节数据：日志中的
@@ -81,6 +95,13 @@ static struct delayed_work ra_poll_work;
 /* All fields below are protected by ra_lock. */
 static bool ra_stopping;
 static u32 ra_last_gauging_status;
+static bool ra_it_status2_valid;
+static u8 ra_it_status2_pack_grid;
+static u8 ra_it_status2_lstatus;
+static u8 ra_it_status2_cell_grid1;
+static u8 ra_it_status2_cell_grid2;
+static int ra_it_status2_last_error;
+static unsigned long ra_it_status2_timestamp;
 static bool ra_it_baseline_valid;
 static s16 ra_it_last_comp_res1;
 static s16 ra_it_last_comp_res2;
@@ -299,6 +320,7 @@ static int ra_read_client_command_locked(struct i2c_client *client,
 	return ret;
 }
 
+/* Caller must hold ra_lock. */
 static int ra_read_gauging_status_locked(void)
 {
 	u8 data[BQ_RA_GAUGING_DATA_LEN];
@@ -311,6 +333,43 @@ static int ra_read_gauging_status_locked(void)
 	return ret;
 }
 
+static const char *ra_it_status2_lstatus_state(u8 lstatus)
+{
+	switch (lstatus) {
+	case 0x00:
+		return "not_learned";
+	case 0x04:
+	case 0x05:
+		return "qmax_updated";
+	case 0x0e:
+		return "qmax_and_ra_updated";
+	default:
+		return "other";
+	}
+}
+
+/* Caller must hold ra_lock. */
+static int ra_read_it_status2_locked(void)
+{
+	u8 data[BQ_RA_IT_STATUS2_DATA_LEN];
+	int ret;
+
+	ret = ra_read_client_command_locked(ra_client, BQ_RA_CMD_IT_STATUS2,
+		data, sizeof(data));
+	if (ret) {
+		ra_it_status2_last_error = ret;
+		return ret;
+	}
+
+	ra_it_status2_pack_grid = data[BQ_RA_IT_STATUS2_PACK_GRID_OFFSET];
+	ra_it_status2_lstatus = data[BQ_RA_IT_STATUS2_LSTATUS_OFFSET];
+	ra_it_status2_cell_grid1 = data[BQ_RA_IT_STATUS2_CELL_GRID1_OFFSET];
+	ra_it_status2_cell_grid2 = data[BQ_RA_IT_STATUS2_CELL_GRID2_OFFSET];
+	ra_it_status2_last_error = 0;
+	ra_it_status2_timestamp = jiffies;
+	ra_it_status2_valid = true;
+	return 0;
+}
 struct ra_it_status1 {
 	s16 true_rem_q;
 	s16 true_rem_e;
@@ -369,6 +428,11 @@ static void ra_poll_workfn(struct work_struct *work)
 	if (ret)
 		pr_err_ratelimited("bq_ra_reader: GaugingStatus poll failed: %d\n",
 			ret);
+
+	/* ITStatus2 is diagnostic only; it does not gate CompRes capture. */
+	ret = ra_read_it_status2_locked();
+	if (ret)
+		pr_err_ratelimited("bq_ra_reader: ITStatus2 poll failed: %d\n", ret);
 
 	ret = ra_read_client_command_locked(ra_client, BQ_RA_CMD_IT_STATUS1,
 		it_status_data, sizeof(it_status_data));
@@ -479,6 +543,82 @@ out_unlock:
 	return len;
 }
 
+static ssize_t ra_it_status2_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	const char *status;
+	const char *lstatus_state;
+	int read_error;
+	bool valid;
+	u8 pack_grid;
+	u8 lstatus;
+	u8 cell_grid1;
+	u8 cell_grid2;
+	unsigned long timestamp;
+
+	mutex_lock(&ra_lock);
+	if (!ra_client) {
+		read_error = -ENODEV;
+	} else {
+		/* A cat gets a fresh ITStatus2 snapshot, not only the worker cache. */
+		read_error = ra_read_it_status2_locked();
+	}
+	valid = ra_it_status2_valid;
+	pack_grid = ra_it_status2_pack_grid;
+	lstatus = ra_it_status2_lstatus;
+	cell_grid1 = ra_it_status2_cell_grid1;
+	cell_grid2 = ra_it_status2_cell_grid2;
+	timestamp = ra_it_status2_timestamp;
+	if (read_error && !valid)
+		status = "error";
+	else if (read_error)
+		status = "stale";
+	else
+		status = "valid";
+	lstatus_state = ra_it_status2_lstatus_state(lstatus);
+	mutex_unlock(&ra_lock);
+
+	if (!valid) {
+		return sysfs_emit(buf,
+			"status=%s\n"
+			"message=ITStatus2 snapshot unavailable\n"
+			"command=0x%04x\n"
+			"command_echo=74 00\n"
+			"read_error=%d\n",
+			status, BQ_RA_CMD_IT_STATUS2, read_error);
+	}
+
+	return sysfs_emit(buf,
+		"status=%s\n"
+		"command=0x%04x\n"
+		"command_echo=74 00\n"
+		"pack_grid=%u\n"
+		"pack_grid_response_offset=2\n"
+		"lstatus=0x%02x\n"
+		"lstatus_response_offset=3\n"
+		"lstatus_qmax=%u\n"
+		"lstatus_iten=%u\n"
+		"lstatus_cf1=%u\n"
+		"lstatus_cf0=%u\n"
+		"lstatus_state=%s\n"
+		"cell_grid1=%u\n"
+		"cell_grid1_response_offset=4\n"
+		"cell_grid2=%u\n"
+		"cell_grid2_response_offset=5\n"
+		"raw_payload=%02x %02x %02x %02x\n"
+		"capture_timestamp_jiffies=%lu\n"
+		"read_error=%d\n",
+		status, BQ_RA_CMD_IT_STATUS2,
+		pack_grid, lstatus,
+		!!(lstatus & IT_STATUS2_LSTATUS_QMAX),
+		!!(lstatus & IT_STATUS2_LSTATUS_ITEN),
+		!!(lstatus & IT_STATUS2_LSTATUS_CF1),
+		!!(lstatus & IT_STATUS2_LSTATUS_CF0),
+		lstatus_state, cell_grid1, cell_grid2,
+		pack_grid, lstatus, cell_grid1, cell_grid2,
+		timestamp, read_error);
+}
+
 static int ra_format_mohm(char *buf, size_t size, bool valid, s32 value)
 {
 	s64 magnitude;
@@ -523,8 +663,8 @@ static ssize_t ra_comp_res_show(struct kobject *kobj,
 			"status=valid\n"
 			"comp_res1_raw=%d\n"
 			"comp_res2_raw=%d\n"
-			"ra_scale0=%u\n"
-			"ra_scale1=%u\n"
+			"ra_scale0=%d\n"
+			"ra_scale1=%d\n"
 			"cell1_mohm=%s\n"
 			"cell2_mohm=%s\n"
 			"capture_timestamp_jiffies=%lu\n"
@@ -547,6 +687,8 @@ static ssize_t ra_comp_res_show(struct kobject *kobj,
 static struct kobj_attribute ra_table_attr = __ATTR_RO(ra_table);
 static struct kobj_attribute ra_comp_res_attr =
 	__ATTR(comp_res, 0444, ra_comp_res_show, NULL);
+static struct kobj_attribute ra_it_status2_attr =
+	__ATTR(it_status2, 0444, ra_it_status2_show, NULL);
 
 static int __init bq_ra_reader_init(void)
 {
@@ -563,10 +705,14 @@ static int __init bq_ra_reader_init(void)
 	ra_client = context.client;
 	mutex_lock(&ra_lock);
 	ret = ra_read_gauging_status_locked();
-	mutex_unlock(&ra_lock);
 	if (ret)
 		pr_warn("bq_ra_reader: initial GaugingStatus read failed: %d; "
 			"polling will retry the diagnostic snapshot\n", ret);
+	ret = ra_read_it_status2_locked();
+	mutex_unlock(&ra_lock);
+	if (ret)
+		pr_warn("bq_ra_reader: initial ITStatus2 read failed: %d; "
+			"sysfs and polling will retry it\n", ret);
 
 	ra_kobj = kobject_create_and_add("bq_ra_reader", kernel_kobj);
 	if (!ra_kobj) {
@@ -582,12 +728,18 @@ static int __init bq_ra_reader_init(void)
 	if (ret)
 		goto remove_table;
 
+	ret = sysfs_create_file(ra_kobj, &ra_it_status2_attr.attr);
+	if (ret)
+		goto remove_comp_res;
+
 	pr_info("bq_ra_reader: ready for %s-%04x, poll_interval=%ums\n",
 		dev_name(&ra_client->adapter->dev), ra_client->addr,
 		ra_effective_poll_interval_ms());
 	schedule_delayed_work(&ra_poll_work, ra_poll_delay());
 	return 0;
 
+remove_comp_res:
+	sysfs_remove_file(ra_kobj, &ra_comp_res_attr.attr);
 remove_table:
 	sysfs_remove_file(ra_kobj, &ra_table_attr.attr);
 del_kobj:
@@ -609,6 +761,7 @@ static void __exit bq_ra_reader_exit(void)
 	cancel_delayed_work_sync(&ra_poll_work);
 
 	if (ra_kobj) {
+		sysfs_remove_file(ra_kobj, &ra_it_status2_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_comp_res_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_table_attr.attr);
 		kobject_put(ra_kobj);
