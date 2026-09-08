@@ -40,6 +40,25 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define BQ_RA_CMD_IT_STATUS2		0x0074
 #define BQ_RA_READ_LEN			36
 
+/*
+ * Data Flash Access()：和 MAC 命令一样复用 0x3E/0x40 寄存器，但写入的是
+ * Data Flash 起始地址（小端），读回固定 32 字节原始 flash 内容
+ * （从 response[2] 开始）。后面 response[34]/[35] 是否仍遵循
+ * checksum/length 收尾格式暂未确认，本次不强制校验，仅打印原始 hex
+ * 供人工核对。
+ */
+#define BQ_RA_DF_DATA_LEN		32
+#define BQ_RA_DF_GRID_COUNT		15
+#define BQ_RA_DF_FLAG_OFFSET		0
+#define BQ_RA_DF_GRID0_OFFSET		2
+
+/* Ra Table 的 Data Flash 直接地址（写入时按小端拆分）。 */
+#define BQ_RA_DF_RA0_ADDR		0x4100 /* Cell0 Ra 主表 */
+#define BQ_RA_DF_RA1_ADDR		0x414C /* Cell1 Ra 主表 */
+#define BQ_RA_DF_RA0X_ADDR		0x4198 /* Cell0 Ra 备份表 */
+#define BQ_RA_DF_RA1X_ADDR		0x41E4 /* Cell1 Ra 备份表 */
+/* TODO: 后续可将上述三个地址传给 ra_read_data_flash_locked() 读取对应表。 */
+
 /* ITStatus2 response[2..5]: Pack Grid, LStatus, Cell Grid1, Cell Grid2. */
 #define BQ_RA_IT_STATUS2_DATA_LEN	4
 #define BQ_RA_IT_STATUS2_PACK_GRID_OFFSET	0
@@ -110,12 +129,32 @@ static s16 ra_comp_res1_raw;
 static s16 ra_comp_res2_raw;
 static s16 ra_comp_ra_scale0;
 static s16 ra_comp_ra_scale1;
+static bool ra_comp_ra_scale0_negative;
+static bool ra_comp_ra_scale1_negative;
 static bool ra_comp_cell1_valid;
 static bool ra_comp_cell2_valid;
 static s32 ra_comp_cell1_mohm_x10;
 static s32 ra_comp_cell2_mohm_x10;
 static u32 ra_comp_capture_count;
 static unsigned long ra_comp_timestamp;
+
+/* Ra Table 网格点原始值换算成 x10 毫欧：raw * 1000 / 1024 * 10。 */
+#define RA_DF_GRID_TO_MOHM_X10_FACTOR	10000
+#define RA_DF_GRID_TO_MOHM_X10_DIV	1024
+
+/* 解析后的 Ra Table 本体（由 ra_lock 保护）。 */
+struct ra_df_table {
+	bool valid;
+	u16 flag;
+	u8 flag_hi;
+	u8 flag_lo;
+	s16 grid_raw[BQ_RA_DF_GRID_COUNT];
+	s32 grid_mohm_x10[BQ_RA_DF_GRID_COUNT];
+	int last_error;
+	unsigned long timestamp;
+};
+
+static struct ra_df_table ra_table_a0;
 
 struct ra_find_context {
 	struct i2c_client *client;
@@ -320,6 +359,121 @@ static int ra_read_client_command_locked(struct i2c_client *client,
 	return ret;
 }
 
+/*
+ * Data Flash Access 读取原语。和 MAC 命令不同：写入的是 Data Flash 起始
+ * 地址（小端），读回固定 BQ_RA_DF_DATA_LEN 字节原始 flash 内容
+ * （从 response[2] 开始）。此函数不做 checksum 校验（response[34]/[35]
+ * 的收尾格式尚未确认），只做 I2C 层面错误检查并打印完整 36 字节 hex。
+ *
+ * TODO: 若人工核对日志确认 response[34]/[35] 遵循 checksum 规律，
+ *       可在此处补上校验逻辑。
+ */
+static int ra_read_data_flash_block(const struct i2c_client *client,
+				    u16 df_addr, u8 *data)
+{
+	u8 response[BQ_RA_READ_LEN];
+	u8 value;
+	int ret;
+	int i;
+
+	if (!data)
+		return -EINVAL;
+
+	value = df_addr & 0xff;
+	ret = ra_smbus_byte_data(client, false, BQ_RA_REG_ALT_MAC, &value);
+	if (ret)
+		return ret;
+	value = df_addr >> 8;
+	ret = ra_smbus_byte_data(client, false, BQ_RA_REG_ALT_MAC + 1, &value);
+	if (ret)
+		return ret;
+
+	/* 与 MAC 读取保持一致的交货延迟。 */
+	msleep(4);
+
+	for (i = 0; i < BQ_RA_READ_LEN; i++) {
+		ret = ra_smbus_byte_data(client, true, BQ_RA_REG_ALT_MAC + i,
+			&response[i]);
+		if (ret)
+			return ret;
+	}
+
+	/* 完整打印 36 字节，供人工核对 response[34]/[35] 收尾规律。 */
+	pr_info("bq_ra_reader: df addr=0x%04x raw[0..35]:"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x %02x %02x %02x %02x"
+		" %02x %02x %02x %02x\n",
+		df_addr,
+		response[0], response[1], response[2], response[3],
+		response[4], response[5], response[6], response[7],
+		response[8], response[9], response[10], response[11],
+		response[12], response[13], response[14], response[15],
+		response[16], response[17], response[18], response[19],
+		response[20], response[21], response[22], response[23],
+		response[24], response[25], response[26], response[27],
+		response[28], response[29], response[30], response[31],
+		response[32], response[33], response[34], response[35]);
+
+	memcpy(data, &response[2], BQ_RA_DF_DATA_LEN);
+	return 0;
+}
+
+/* 简化版单位换算：raw * 1000 / 1024 * 10，x10 定点毫欧，s64 先乘后除。 */
+static s32 ra_grid_to_mohm_x10(s16 raw)
+{
+	s64 value = (s64)raw * RA_DF_GRID_TO_MOHM_X10_FACTOR;
+
+	return (s32)(value / RA_DF_GRID_TO_MOHM_X10_DIV);
+}
+
+/* 解析 32 字节 Data Flash 数据到 Ra Table 结构。 */
+static void ra_parse_df_table(const u8 *data, struct ra_df_table *table)
+{
+	unsigned int i;
+
+	table->flag = ra_le16(data, BQ_RA_DF_FLAG_OFFSET);
+	table->flag_hi = (u8)(table->flag >> 8);
+	table->flag_lo = (u8)(table->flag & 0xff);
+	for (i = 0; i < BQ_RA_DF_GRID_COUNT; i++) {
+		table->grid_raw[i] = ra_sle16(data,
+			BQ_RA_DF_GRID0_OFFSET + i * 2);
+		table->grid_mohm_x10[i] = ra_grid_to_mohm_x10(table->grid_raw[i]);
+	}
+	table->timestamp = jiffies;
+}
+
+/* Caller must hold ra_lock. */
+static int ra_read_data_flash_locked(struct i2c_client *client, u16 df_addr,
+				     struct ra_df_table *table)
+{
+	u8 data[BQ_RA_DF_DATA_LEN];
+	int ret;
+
+	if (!client || !table)
+		return -ENODEV;
+
+	device_lock(&client->dev);
+	if (!client->dev.driver ||
+		strcmp(client->dev.driver->name, BQ_RA_DRIVER_NAME)) {
+		device_unlock(&client->dev);
+		return -ENODEV;
+	}
+
+	i2c_lock_bus(client->adapter, I2C_LOCK_SEGMENT);
+	ret = ra_read_data_flash_block(client, df_addr, data);
+	i2c_unlock_bus(client->adapter, I2C_LOCK_SEGMENT);
+	device_unlock(&client->dev);
+	if (ret)
+		return ret;
+
+	ra_parse_df_table(data, table);
+	table->valid = true;
+	table->last_error = 0;
+	return 0;
+}
+
 /* Caller must hold ra_lock. */
 static int ra_read_gauging_status_locked(void)
 {
@@ -331,6 +485,36 @@ static int ra_read_gauging_status_locked(void)
 	if (!ret)
 		ra_last_gauging_status = ra_status_value(data);
 	return ret;
+}
+
+static const char *ra_df_flag_update_state(u8 flag_hi)
+{
+	switch (flag_hi) {
+	case 0x00:
+		return "updated";
+	case 0x05:
+		return "relax_updating";
+	case 0x55:
+		return "discharge_updated";
+	case 0xff:
+		return "never_updated";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *ra_df_flag_usage_state(u8 flag_lo)
+{
+	switch (flag_lo) {
+	case 0x00:
+		return "unused";
+	case 0x55:
+		return "in_use";
+	case 0xff:
+		return "never_used";
+	default:
+		return "unknown";
+	}
 }
 
 static const char *ra_it_status2_lstatus_state(u8 lstatus)
@@ -413,6 +597,8 @@ static void ra_poll_workfn(struct work_struct *work)
 	u16 scale1;
 	s32 cell1_mohm_x10;
 	s32 cell2_mohm_x10;
+	bool scale0_valid;
+	bool scale1_valid;
 	bool cell1_valid;
 	bool cell2_valid;
 	bool changed;
@@ -446,8 +632,10 @@ static void ra_poll_workfn(struct work_struct *work)
 	comp_res2 = it_status.comp_res2;
 	scale0_raw = it_status.ra_scale0;
 	scale1_raw = it_status.ra_scale1;
-	scale0 = scale0_raw > 0 ? scale0_raw : 0;
-	scale1 = scale1_raw > 0 ? scale1_raw : 0;
+	scale0_valid = scale0_raw > 0;
+	scale1_valid = scale1_raw > 0;
+	scale0 = scale0_valid ? (u16)scale0_raw : 0;
+	scale1 = scale1_valid ? (u16)scale1_raw : 0;
 	if (!ra_it_baseline_valid) {
 		ra_it_last_comp_res1 = comp_res1;
 		ra_it_last_comp_res2 = comp_res2;
@@ -462,14 +650,16 @@ static void ra_poll_workfn(struct work_struct *work)
 	if (!changed)
 		goto reschedule;
 
-	cell1_valid = ra_comp_res_to_mohm_x10(comp_res1, scale0,
-		&cell1_mohm_x10);
-	cell2_valid = ra_comp_res_to_mohm_x10(comp_res2, scale1,
-		&cell2_mohm_x10);
+	cell1_valid = scale0_valid &&
+		ra_comp_res_to_mohm_x10(comp_res1, scale0, &cell1_mohm_x10);
+	cell2_valid = scale1_valid &&
+		ra_comp_res_to_mohm_x10(comp_res2, scale1, &cell2_mohm_x10);
 	ra_comp_res1_raw = comp_res1;
 	ra_comp_res2_raw = comp_res2;
-	ra_comp_ra_scale0 = scale0;
-	ra_comp_ra_scale1 = scale1;
+	ra_comp_ra_scale0 = scale0_raw;
+	ra_comp_ra_scale1 = scale1_raw;
+	ra_comp_ra_scale0_negative = scale0_raw < 0;
+	ra_comp_ra_scale1_negative = scale1_raw < 0;
 	ra_comp_cell1_valid = cell1_valid;
 	ra_comp_cell2_valid = cell2_valid;
 	ra_comp_cell1_mohm_x10 = cell1_mohm_x10;
@@ -619,6 +809,77 @@ static ssize_t ra_it_status2_show(struct kobject *kobj,
 		timestamp, read_error);
 }
 
+static int ra_format_mohm(char *buf, size_t size, bool valid, s32 value);
+
+static ssize_t ra_table_a0_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct ra_df_table table;
+	struct i2c_client *client;
+	char grid_mohm[32];
+	const char *update_state;
+	const char *usage_state;
+	ssize_t len;
+	int ret;
+	unsigned int i;
+
+	mutex_lock(&ra_lock);
+	client = ra_client;
+	if (!client) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	/* 只在读取该节点时发起一次 Data Flash 实时读取。 */
+	table = ra_table_a0;
+	ret = ra_read_data_flash_locked(client, BQ_RA_DF_RA0_ADDR, &table);
+	if (ret) {
+		ra_table_a0.last_error = ret;
+		goto out_unlock;
+	}
+	ra_table_a0 = table;
+
+out_unlock:
+	if (ret) {
+		mutex_unlock(&ra_lock);
+		pr_err_ratelimited("bq_ra_reader: R_a0 Data Flash read failed: %d\n",
+			ret);
+		return ret;
+	}
+
+	table = ra_table_a0;
+	mutex_unlock(&ra_lock);
+
+	update_state = ra_df_flag_update_state(table.flag_hi);
+	usage_state = ra_df_flag_usage_state(table.flag_lo);
+	len = 0;
+	if (table.flag_hi == 0xff)
+		len += sysfs_emit_at(buf, len,
+			"warning=this table may be factory default, not learned data\n");
+	len += sysfs_emit_at(buf, len,
+		"status=valid\n"
+		"address=0x%04x\n"
+		"flag_raw=0x%04x\n"
+		"flag_high=0x%02x\n"
+		"flag_low=0x%02x\n"
+		"flag_update_state=%s\n"
+		"flag_usage_state=%s\n"
+		"capture_timestamp_jiffies=%lu\n",
+		BQ_RA_DF_RA0_ADDR, table.flag, table.flag_hi, table.flag_lo,
+		update_state, usage_state, table.timestamp);
+
+	for (i = 0; i < BQ_RA_DF_GRID_COUNT; i++) {
+		ra_format_mohm(grid_mohm, sizeof(grid_mohm), true,
+			table.grid_mohm_x10[i]);
+		len += sysfs_emit_at(buf, len, "grid%u_raw=%d\n", i,
+			table.grid_raw[i]);
+		len += sysfs_emit_at(buf, len, "grid%u_mohm=%s\n", i,
+			grid_mohm);
+	}
+
+	return len;
+}
+
 static int ra_format_mohm(char *buf, size_t size, bool valid, s32 value)
 {
 	s64 magnitude;
@@ -665,6 +926,8 @@ static ssize_t ra_comp_res_show(struct kobject *kobj,
 			"comp_res2_raw=%d\n"
 			"ra_scale0=%d\n"
 			"ra_scale1=%d\n"
+			"ra_scale0_negative=%u\n"
+			"ra_scale1_negative=%u\n"
 			"cell1_mohm=%s\n"
 			"cell2_mohm=%s\n"
 			"capture_timestamp_jiffies=%lu\n"
@@ -674,6 +937,7 @@ static ssize_t ra_comp_res_show(struct kobject *kobj,
 			"poll_interval_effective_ms=%u\n",
 			ra_comp_res1_raw, ra_comp_res2_raw,
 			ra_comp_ra_scale0, ra_comp_ra_scale1,
+			ra_comp_ra_scale0_negative, ra_comp_ra_scale1_negative,
 			cell1_mohm, cell2_mohm, ra_comp_timestamp,
 			ra_comp_capture_count,
 			single_cell_hint ? "Cell2 may be unused on a single-cell design" :
@@ -689,6 +953,8 @@ static struct kobj_attribute ra_comp_res_attr =
 	__ATTR(comp_res, 0444, ra_comp_res_show, NULL);
 static struct kobj_attribute ra_it_status2_attr =
 	__ATTR(it_status2, 0444, ra_it_status2_show, NULL);
+static struct kobj_attribute ra_table_a0_attr =
+	__ATTR(ra_table_a0, 0444, ra_table_a0_show, NULL);
 
 static int __init bq_ra_reader_init(void)
 {
@@ -732,12 +998,18 @@ static int __init bq_ra_reader_init(void)
 	if (ret)
 		goto remove_comp_res;
 
+	ret = sysfs_create_file(ra_kobj, &ra_table_a0_attr.attr);
+	if (ret)
+		goto remove_it_status2;
+
 	pr_info("bq_ra_reader: ready for %s-%04x, poll_interval=%ums\n",
 		dev_name(&ra_client->adapter->dev), ra_client->addr,
 		ra_effective_poll_interval_ms());
 	schedule_delayed_work(&ra_poll_work, ra_poll_delay());
 	return 0;
 
+remove_it_status2:
+	sysfs_remove_file(ra_kobj, &ra_it_status2_attr.attr);
 remove_comp_res:
 	sysfs_remove_file(ra_kobj, &ra_comp_res_attr.attr);
 remove_table:
@@ -761,6 +1033,7 @@ static void __exit bq_ra_reader_exit(void)
 	cancel_delayed_work_sync(&ra_poll_work);
 
 	if (ra_kobj) {
+		sysfs_remove_file(ra_kobj, &ra_table_a0_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_it_status2_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_comp_res_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_table_attr.attr);
@@ -779,5 +1052,5 @@ static void __exit bq_ra_reader_exit(void)
 module_init(bq_ra_reader_init);
 module_exit(bq_ra_reader_exit);
 
-MODULE_DESCRIPTION("BQ28Z610 ITStatus1 CompRes change probe");
+MODULE_DESCRIPTION("BQ28Z610 ITStatus and Data Flash Ra Table probe");
 MODULE_LICENSE("GPL v2");
