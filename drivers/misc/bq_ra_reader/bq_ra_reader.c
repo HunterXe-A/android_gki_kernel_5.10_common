@@ -595,8 +595,8 @@ static void ra_poll_workfn(struct work_struct *work)
 	s16 scale1_raw;
 	u16 scale0;
 	u16 scale1;
-	s32 cell1_mohm_x10;
-	s32 cell2_mohm_x10;
+	s32 cell1_mohm_x10 = 0;
+	s32 cell2_mohm_x10 = 0;
 	bool scale0_valid;
 	bool scale1_valid;
 	bool cell1_valid;
@@ -667,9 +667,9 @@ static void ra_poll_workfn(struct work_struct *work)
 	ra_comp_timestamp = jiffies;
 	ra_comp_capture_count++;
 	ra_have_comp_res = true;
-	pr_info("bq_ra_reader: ITStatus1 changed comp_res1=%d scale0=%u "
-		"comp_res2=%d scale1=%u cell1=%s cell2=%s count=%u\n",
-		comp_res1, scale0, comp_res2, scale1,
+	pr_info("bq_ra_reader: ITStatus1 changed comp_res1=%d scale0_raw=%d "
+		"comp_res2=%d scale1_raw=%d cell1=%s cell2=%s count=%u\n",
+		comp_res1, scale0_raw, comp_res2, scale1_raw,
 		cell1_valid ? "valid" : "n/a",
 		cell2_valid ? "valid" : "n/a", ra_comp_capture_count);
 
