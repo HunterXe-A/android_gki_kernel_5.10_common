@@ -4,3 +4,12 @@ config BQ_RA_READER
 	depends on I2C && I2C_SMBUS && SYSFS
 	help
 	  Read the NFG1000B/BQ28Z610 RA table through a read-only sysfs node.
+
+config RA_READER
+	tristate "Reusable I2C MAC read framework"
+	depends on I2C && I2C_SMBUS && SYSFS
+	help
+	  A generic, chip-agnostic I2C AltManufacturerAccess (MAC) read framework.
+	  Write a command number to sysfs and the module reads the raw 36-byte
+	  response 5 seconds later into a read-only sysfs node. No chip-specific
+	  field parsing is performed.

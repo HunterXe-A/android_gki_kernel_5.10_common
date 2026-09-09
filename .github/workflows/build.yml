@@ -73,6 +73,7 @@ jobs:
           # I2C && I2C_SMBUS && SYSFS) survives olddefconfig.
           printf '%s\n' 'CONFIG_I2C_SMBUS=y' >> "$KBUILD_OUTPUT/.config"
           printf '%s\n' 'CONFIG_BQ_RA_READER=m' >> "$KBUILD_OUTPUT/.config"
+          printf '%s\n' 'CONFIG_RA_READER=m' >> "$KBUILD_OUTPUT/.config"
           sed -i \
             -e '/^CONFIG_LOCALVERSION_AUTO=/d' \
             -e '/^# CONFIG_LOCALVERSION_AUTO is not set$/d' \
@@ -94,6 +95,7 @@ jobs:
           grep -q '^CONFIG_CFI_CLANG=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_I2C_SMBUS=y$' "$KBUILD_OUTPUT/.config"
           grep -q '^CONFIG_BQ_RA_READER=m$' "$KBUILD_OUTPUT/.config"
+          grep -q '^CONFIG_RA_READER=m$' "$KBUILD_OUTPUT/.config"
 
       - name: Download kernel symbol table (reuse previous build)
         env:
@@ -114,7 +116,7 @@ jobs:
           KERNEL_RELEASE="$(make --no-print-directory O="$KBUILD_OUTPUT" kernelrelease)"
           printf 'reused symvers kernelrelease=%s\n' "$KERNEL_RELEASE"
 
-      - name: Build bq_ra_reader module
+      - name: Build bq_ra_reader and raR modules
         run: |
           set -x
           make O="$KBUILD_OUTPUT" \
@@ -122,58 +124,63 @@ jobs:
             CC="ccache clang" \
             HOSTCC="ccache clang" \
             drivers/misc/bq_ra_reader/bq_ra_reader.ko \
+            drivers/misc/bq_ra_reader/raR.ko \
             -j"$(nproc)" || { echo "FAIL: make exit code $?"; exit 1; }
           echo "make OK"
           ls -la "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/" 2>&1
-          test -s "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/bq_ra_reader.ko" || { echo "FAIL: .ko missing"; exit 1; }
+          test -s "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/bq_ra_reader.ko" || { echo "FAIL: bq_ra_reader.ko missing"; exit 1; }
+          test -s "$KBUILD_OUTPUT/drivers/misc/bq_ra_reader/raR.ko" || { echo "FAIL: raR.ko missing"; exit 1; }
           ls -la "$KBUILD_OUTPUT"/Module.symvers 2>&1
           test -s "$KBUILD_OUTPUT/Module.symvers" || { echo "FAIL: Module.symvers missing"; exit 1; }
 
-      - name: Verify bq_ra_reader ABI and metadata
+      - name: Verify modules ABI and metadata
         env:
           RA: out/drivers/misc/bq_ra_reader/bq_ra_reader.ko
+          RAR: out/drivers/misc/bq_ra_reader/raR.ko
         run: |
           set -euo pipefail
 
           KERNEL_RELEASE="$(cat out/include/config/kernel.release)"
 
-          llvm-readelf -h "$RA" > ra.header.txt
-          grep -q 'Class:.*ELF64' ra.header.txt
-          grep -q 'Machine:.*AArch64' ra.header.txt
+          for M in "$RA" "$RAR"; do
+            B="$(basename "$M" .ko)"
+            llvm-readelf -h "$M" > "$B.header.txt"
+            grep -q 'Class:.*ELF64' "$B.header.txt"
+            grep -q 'Machine:.*AArch64' "$B.header.txt"
 
-          llvm-readelf -p .modinfo "$RA" > ra.modinfo.txt
-          grep -q 'name=bq_ra_reader' ra.modinfo.txt
-          grep -Fq "vermagic=$KERNEL_RELEASE " ra.modinfo.txt
+            llvm-readelf -p .modinfo "$M" > "$B.modinfo.txt"
+            grep -Fq "vermagic=$KERNEL_RELEASE " "$B.modinfo.txt"
 
-          llvm-readelf -SW "$RA" > ra.sections.txt
-          RA_VERSIONS_LINE="$(awk '$2 == "__versions" {print; exit}' ra.sections.txt)"
-          test -n "$RA_VERSIONS_LINE"
-          RA_VERSIONS_SIZE="$(printf '%s\n' "$RA_VERSIONS_LINE" | awk '{print $(NF-5)}')"
-          test "$RA_VERSIONS_SIZE" != "000000"
-          llvm-readelf -p __versions "$RA" > ra.versions.txt
-          grep -q 'module_layout' ra.versions.txt
-          grep -q '__i2c_smbus_xfer' ra.versions.txt
-          grep -q 'i2c_for_each_dev' ra.versions.txt
-          grep -q 'i2c_verify_client' ra.versions.txt
+            llvm-readelf -SW "$M" > "$B.sections.txt"
+            VS="$(awk '$2 == "__versions" {print; exit}' "$B.sections.txt")"
+            test -n "$VS"
+            SZ="$(printf '%s\n' "$VS" | awk '{print $(NF-5)}')"
+            test "$SZ" != "000000"
+            llvm-readelf -p __versions "$M" > "$B.versions.txt"
+            grep -q 'module_layout' "$B.versions.txt"
+            grep -q '__i2c_smbus_xfer' "$B.versions.txt"
+            grep -q 'i2c_for_each_dev' "$B.versions.txt"
+            grep -q 'i2c_verify_client' "$B.versions.txt"
 
-          llvm-nm -a "$RA" > ra.nm.txt
-          grep -q '[[:space:]]__cfi_check$' ra.nm.txt
-          grep -q '[[:space:]]__cfi_jt_start$' ra.nm.txt
-          grep -q '[[:space:]]__cfi_jt_end$' ra.nm.txt
-          ! grep -q '[[:space:]]bms_get_batt_sn$' ra.nm.txt
-          ! grep -q '[[:space:]]bms_get_property$' ra.nm.txt
-          ! grep -q '[[:space:]]bms_set_property$' ra.nm.txt
+            llvm-nm -a "$M" > "$B.nm.txt"
+            grep -q '[[:space:]]__cfi_check$' "$B.nm.txt"
+            grep -q '[[:space:]]__cfi_jt_start$' "$B.nm.txt"
+            grep -q '[[:space:]]__cfi_jt_end$' "$B.nm.txt"
+            ! grep -q '[[:space:]]bms_get_batt_sn$' "$B.nm.txt"
+            ! grep -q '[[:space:]]bms_get_property$' "$B.nm.txt"
+            ! grep -q '[[:space:]]bms_set_property$' "$B.nm.txt"
+            echo "ABI checks passed for $B.ko."
+            sha256sum "$M"
+          done
 
-          echo 'ABI checks passed for bq_ra_reader.ko.'
-          sha256sum "$RA"
-
-      - name: Upload bq_ra_reader module
+      - name: Upload modules
         uses: actions/upload-artifact@v4
         with:
           name: bq_ra_reader-xaga
           if-no-files-found: error
           path: |
             out/drivers/misc/bq_ra_reader/bq_ra_reader.ko
+            out/drivers/misc/bq_ra_reader/raR.ko
             out/Module.symvers
             out/vmlinux.symvers
             out/modules-only.symvers
@@ -182,8 +189,13 @@ jobs:
             out-symvers/vmlinux.symvers
             out-symvers/System.map
             out-symvers/.config
-            ra.header.txt
-            ra.modinfo.txt
-            ra.sections.txt
-            ra.versions.txt
-            ra.nm.txt
+            bq_ra_reader.header.txt
+            bq_ra_reader.modinfo.txt
+            bq_ra_reader.sections.txt
+            bq_ra_reader.versions.txt
+            bq_ra_reader.nm.txt
+            raR.header.txt
+            raR.modinfo.txt
+            raR.sections.txt
+            raR.versions.txt
+            raR.nm.txt

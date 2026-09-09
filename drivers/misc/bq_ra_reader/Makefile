@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 obj-$(CONFIG_BQ_RA_READER) += bq_ra_reader.o
+obj-$(CONFIG_RA_READER) += raR.o
 
 # 设备内核（MT6895Z）KASAN_HW_TAGS/MTE 开启后，sp_el0 在模块 init 时
 # 可能不是 current 指针，stack protector 序言读 current->stack_canary
