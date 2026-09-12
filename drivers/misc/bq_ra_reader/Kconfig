@@ -7,7 +7,7 @@ config BQ_RA_READER
 
 config RA_READER
 	tristate "Reusable I2C MAC read framework"
-	depends on I2C && I2C_SMBUS && SYSFS && MI_HARDWARE_ID
+	depends on I2C && I2C_SMBUS && SYSFS
 	help
 	  An I2C AltManufacturerAccess (MAC) read framework for the bq28z610
 	  driver. It also provides read-only sealed and read-write seal nodes;

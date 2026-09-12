@@ -323,24 +323,15 @@ error:
 }
 
 /*
- * get_hw_sku 由 hwid 模块导出；CI 纯模块构建时符号不可见，声明为弱符号，
- * 设备加载时由模块加载器解析，解析不到则回退普通 type4 key。
+ * type4 有两套 key：普通 SKU 用 0x645923cf，xagapro 用 0x5502020b。
+ * 内核侧无法读取 hwid 的 SKU：引用弱符号会产生 5.10 加载器不支持的
+ * GOT 重定位（insmod 报 unsupported RELA relocation 312），因此每个
+ * 重试周期交替尝试两套 key；写错 key 无害，gauge 只是拒绝解锁。
  */
-extern const char *get_hw_sku(void) __weak;
-
-static u32 ra_unseal_key(void)
-{
-	const char *sku;
-
-	/* CI 纯模块构建下弱符号未解析，地址为 0 时回退普通 type4 key。 */
-	if (get_hw_sku == NULL)
-		return RA_UNSEAL_KEY;
-
-	sku = get_hw_sku();
-	if (sku && strncmp(sku, "xagapro", strlen("xagapro")) == 0)
-		return RA_UNSEAL_KEY_XAGAPRO;
-	return RA_UNSEAL_KEY;
-}
+static const u32 ra_unseal_keys[] = {
+	RA_UNSEAL_KEY,
+	RA_UNSEAL_KEY_XAGAPRO,
+};
 
 /* 调用者须持有 ra_lock；type4 的 key 顺序为 low-low-high。 */
 static int ra_send_unseal_key_locked(struct i2c_client *client, u32 key)
@@ -364,7 +355,6 @@ static int ra_send_unseal_key_locked(struct i2c_client *client, u32 key)
 static int ra_set_sealed_locked(struct i2c_client *client, bool want_sealed)
 {
 	bool sealed;
-	u32 key;
 	int attempt;
 	int ret = -ETIMEDOUT;
 
@@ -377,7 +367,6 @@ static int ra_set_sealed_locked(struct i2c_client *client, bool want_sealed)
 	if (sealed == want_sealed)
 		return 0;
 
-	key = ra_unseal_key();
 	for (attempt = 0; attempt < RA_UNSEAL_RETRIES; attempt++) {
 		/* Re-check immediately before every security-changing transaction. */
 		ret = ra_check_type4_locked(client);
@@ -388,7 +377,8 @@ static int ra_set_sealed_locked(struct i2c_client *client, bool want_sealed)
 			ret = ra_write_word_locked(client, RA_REG_ALT_MAC,
 						  RA_CMD_SEAL);
 		else
-			ret = ra_send_unseal_key_locked(client, key);
+			ret = ra_send_unseal_key_locked(client,
+				ra_unseal_keys[attempt % ARRAY_SIZE(ra_unseal_keys)]);
 		if (ret) {
 			pr_err_ratelimited("raR: %s command failed attempt=%d ret=%d\n",
 				want_sealed ? "seal" : "unseal", attempt + 1, ret);
