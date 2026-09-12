@@ -24,7 +24,6 @@
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
-#include "../hwid/hwid.h"
 
 /*
  * 设备内核 CONFIG_UBSAN=n + CONFIG_TRIM_UNUSED_KSYMS=y，未导出
@@ -323,11 +322,22 @@ error:
 	return ret;
 }
 
+/*
+ * get_hw_sku 由 hwid 模块导出；CI 纯模块构建时符号不可见，声明为弱符号，
+ * 设备加载时由模块加载器解析，解析不到则回退普通 type4 key。
+ */
+extern const char *get_hw_sku(void) __weak;
+
 static u32 ra_unseal_key(void)
 {
-	const char *sku = get_hw_sku();
+	const char *sku;
 
-	if (sku && !strncmp(sku, "xagapro", strlen("xagapro")))
+	/* CI 纯模块构建下弱符号未解析，地址为 0 时回退普通 type4 key。 */
+	if (get_hw_sku == NULL)
+		return RA_UNSEAL_KEY;
+
+	sku = get_hw_sku();
+	if (sku && strncmp(sku, "xagapro", strlen("xagapro")) == 0)
 		return RA_UNSEAL_KEY_XAGAPRO;
 	return RA_UNSEAL_KEY;
 }
