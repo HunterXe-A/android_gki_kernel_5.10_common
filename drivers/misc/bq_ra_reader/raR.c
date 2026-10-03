@@ -182,11 +182,16 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 	u8 value;
 	u8 length;
 	unsigned int settle_ms;
+	int reason_local;
 	int ret;
 	int i;
 
-	if (!raw_response || !reason)
+	if (!raw_response)
 		return -EINVAL;
+
+	/* reason 只是诊断出口，调用方（type4 识别等）可以传 NULL。 */
+	if (!reason)
+		reason = &reason_local;
 
 	*reason = RA_REASON_OK;
 
