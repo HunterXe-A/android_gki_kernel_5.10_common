@@ -51,7 +51,7 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
  * 重新编译的情况下调整，用来判断 DF 块是否比 MAC 块需要更长整定。
  */
 #define RA_SETTLE_MS_DEFAULT		4
-#define RA_SETTLE_MS_MAX		1000
+#define RA_SETTLE_MS_MAX		5000
 
 /* ra_result_reason 取值（诊断用，校验失败也要说清原因）。 */
 #define RA_REASON_OK			0
@@ -112,14 +112,6 @@ static u8 ra_result_raw[RA_READ_LEN];
 static unsigned long ra_result_timestamp;
 static int ra_result_reason;
 static unsigned int ra_settle_ms = RA_SETTLE_MS_DEFAULT;
-
-/*
- * 上一条读到的窗口。gauge 忽略某条命令时只有 0x3E/0x3F 被我们的写改掉，
- * 窗口其余字节与上一条响应完全相同，据此可以把"没响应"和"真的校验不过"
- * 区分开。
- */
-static u8 ra_prev_raw[RA_READ_LEN];
-static bool ra_prev_valid;
 
 static const char *ra_reason_name(int reason);
 
@@ -193,6 +185,7 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 			     u8 *raw_response, int *reason)
 {
 	u8 response[RA_READ_LEN];
+	u8 before[RA_READ_LEN];
 	u8 value;
 	u8 length;
 	unsigned int settle_ms;
@@ -208,6 +201,20 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 		reason = &reason_local;
 
 	*reason = RA_REASON_OK;
+
+	/*
+	 * 先记下命令之前的窗口。gauge 忽略某个命令时，只有 0x3E/0x3F 会被我们
+	 * 的写改掉，其余字节与命令前完全相同；这样从第一条命令起就能把"没响应"
+	 * 和"响应了但校验不过"区分开，而不是等到第二条才有 prev 可比。
+	 */
+	for (i = 0; i < RA_READ_LEN; i++) {
+		ret = ra_smbus_byte_data(client, true, RA_REG_ALT_MAC + i,
+			&before[i]);
+		if (ret) {
+			*reason = RA_REASON_IO;
+			return ret;
+		}
+	}
 
 	value = cmd & 0xff;
 	ret = ra_smbus_byte_data(client, false, RA_REG_ALT_MAC, &value);
@@ -260,22 +267,16 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 
 	/* 读路径约定：校验和覆盖 length-2 字节（见 fg_mac_read_block）。 */
 	if (ra_checksum(response, length - 2) != response[RA_READ_LEN - 2]) {
-		if (ra_prev_valid &&
-		    !memcmp(&response[2], &ra_prev_raw[2], RA_READ_LEN - 2))
+		if (!memcmp(&response[2], &before[2], RA_READ_LEN - 2))
 			*reason = RA_REASON_STALE;
 		else
 			*reason = RA_REASON_CKSUM;
 
 		pr_err_ratelimited("raR: MAC checksum mismatch cmd=0x%04x len=%u (%s)\n",
 			cmd, length, ra_reason_name(*reason));
-
-		ra_prev_valid = true;
-		memcpy(ra_prev_raw, response, RA_READ_LEN);
 		return -EBADMSG;
 	}
 
-	ra_prev_valid = true;
-	memcpy(ra_prev_raw, response, RA_READ_LEN);
 	return 0;
 }
 
