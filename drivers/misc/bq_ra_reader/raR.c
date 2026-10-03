@@ -2,10 +2,12 @@
 /*
  * Reusable I2C MAC (AltManufacturerAccess) read framework.
  *
- * A BQ28Z610-compatible diagnostic loader that lets the user write a MAC
- * command number into sysfs and, 5 seconds later, reads the full 36-byte
- * MACData() response. It also exposes sealed/seal nodes for type4 gauges;
- * every security-changing operation re-identifies the live gauge first.
+ * A BQ28Z610-compatible diagnostic loader. Writing a 16-bit MAC subcommand or
+ * Data Flash address to AltManufacturerAccess (0x3E lo / 0x3F hi) makes the
+ * gauge fill the 36-byte window 0x3E..0x61; the raw window is always reported,
+ * even when validation fails, so a failing Data Flash read stays diagnosable.
+ * It also exposes sealed/seal nodes for type4 gauges; every security-changing
+ * operation re-identifies the live gauge first.
  *
  * The CFI stub and the client lookup / device+segment bus locking are
  * intentionally kept from the BQ28Z610 probe module so this file can be
@@ -44,7 +46,33 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 
 #define RA_REG_ALT_MAC			0x3e
 #define RA_READ_LEN			36
+/*
+ * mac_cmd 只是把"发起"与"取结果"解耦的调度延迟，不参与 gauge 时序。
+ * 真正落在写地址与读窗口之间的整定时间是 ra_settle_ms。
+ */
 #define RA_WRITE_TO_READ_DELAY_MS	5000
+
+/*
+ * 写 0x3E/0x3F 之后、读窗口之前的整定时间。原 gauge 驱动的
+ * fg_mac_read_block() 用 udelay(4000)，约 4ms；可用 settle_ms 节点在不
+ * 重新编译的情况下调整，用来判断 DF 块是否比 MAC 块需要更长整定。
+ */
+#define RA_SETTLE_MS_DEFAULT		4
+#define RA_SETTLE_MS_MAX		1000
+
+/* ra_result_reason 取值（诊断用，校验失败也要说清原因）。 */
+#define RA_REASON_OK			0
+#define RA_REASON_LENGTH		1
+#define RA_REASON_CKSUM			2
+#define RA_REASON_EMPTY			3
+#define RA_REASON_IO			4
+
+/* RA 表所在的四个 32 字节 DF 块（Cell0/Cell1 及其影子表）。 */
+#define RA_DF_CELL0_RA			0x4100
+#define RA_DF_CELL1_RA			0x4140
+#define RA_DF_XCELL0_RA			0x4180
+#define RA_DF_XCELL1_RA			0x41c0
+#define RA_TABLE_POINTS			15
 
 /* BQ28Z610/NFG MAC 命令和安全状态协议。 */
 #define RA_CMD_DEVICE_NAME		0x004a
@@ -78,6 +106,8 @@ static bool ra_result_valid;
 static int ra_result_error;
 static u8 ra_result_raw[RA_READ_LEN];
 static unsigned long ra_result_timestamp;
+static int ra_result_reason;
+static unsigned int ra_settle_ms = RA_SETTLE_MS_DEFAULT;
 
 struct ra_find_context {
 	struct i2c_client *client;
@@ -133,64 +163,96 @@ static int ra_smbus_byte_data(const struct i2c_client *client, bool read,
 }
 
 /*
- * Read one MAC command. Caller must hold ra_lock. Writes the command number
- * to AltManufacturerAccess (0x3E/0x3F), waits, then reads the fixed 36-byte
- * MACData window. The checksum byte is kept at response[34] and the length at
- * response[35], matching the official fg_mac_read_block() implementation.
+ * Read one MAC command / Data Flash address. Caller must hold ra_lock.
+ *
+ * Writes the 16-bit command word to AltManufacturerAccess (0x3E lo / 0x3F hi),
+ * waits ra_settle_ms, then reads the fixed 36-byte window 0x3E..0x61:
+ *   [0..1]   0x3E/0x3F command echo
+ *   [2..33]  0x40..0x5F payload
+ *   [34]     0x60 checksum
+ *   [35]     0x61 length
+ *
+ * The raw window is handed back to the caller even when validation fails, so a
+ * failing Data Flash read can still be diagnosed from sysfs.
  */
 static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
-			     u8 *raw_response)
+			     u8 *raw_response, int *reason)
 {
 	u8 response[RA_READ_LEN];
 	u8 value;
 	u8 length;
-	u8 checksum;
+	unsigned int settle_ms;
 	int ret;
 	int i;
 
-	if (!raw_response)
+	if (!raw_response || !reason)
 		return -EINVAL;
+
+	*reason = RA_REASON_OK;
 
 	value = cmd & 0xff;
 	ret = ra_smbus_byte_data(client, false, RA_REG_ALT_MAC, &value);
-	if (ret)
+	if (ret) {
+		*reason = RA_REASON_IO;
 		return ret;
+	}
 	value = cmd >> 8;
 	ret = ra_smbus_byte_data(client, false, RA_REG_ALT_MAC + 1, &value);
-	if (ret)
+	if (ret) {
+		*reason = RA_REASON_IO;
 		return ret;
+	}
 
-	/* Match the delay used by fg_mac_read_block(). */
-	msleep(4);
+	/* 与原 gauge 的 fg_mac_read_block() 一致：写地址后先整定再读窗口。 */
+	settle_ms = ra_settle_ms;
+	if (settle_ms)
+		msleep(settle_ms);
 
 	/* Read each register separately, matching fg_read_block(). */
 	for (i = 0; i < RA_READ_LEN; i++) {
 		ret = ra_smbus_byte_data(client, true, RA_REG_ALT_MAC + i,
 			&response[i]);
-		if (ret)
+		if (ret) {
+			*reason = RA_REASON_IO;
 			return ret;
+		}
 	}
+
+	/* 先留证据：任何校验分支都不再吞掉窗口内容。 */
+	memcpy(raw_response, response, RA_READ_LEN);
 
 	length = response[RA_READ_LEN - 1];
+	if (length == 2) {
+		/* fg_mac_read_block() 把 length==2 当合法空块，校验固定 0xFF。 */
+		if (response[RA_READ_LEN - 2] != 0xff) {
+			*reason = RA_REASON_CKSUM;
+			return -EBADMSG;
+		}
+		*reason = RA_REASON_EMPTY;
+		return 0;
+	}
+
 	if (length < 3 || length > RA_READ_LEN) {
-		pr_err("raR: invalid MAC response cmd=0x%04x len=%u\n", cmd,
-			length);
+		pr_err_ratelimited("raR: bad MAC response cmd=0x%04x len=%u\n",
+			cmd, length);
+		*reason = RA_REASON_LENGTH;
 		return -EBADMSG;
 	}
 
-	checksum = ra_checksum(response, length - 2);
-	if (checksum != response[RA_READ_LEN - 2]) {
-		pr_err("raR: MAC checksum mismatch cmd=0x%04x\n", cmd);
+	/* 读路径约定：校验和覆盖 length-2 字节（见 fg_mac_read_block）。 */
+	if (ra_checksum(response, length - 2) != response[RA_READ_LEN - 2]) {
+		pr_err_ratelimited("raR: MAC checksum mismatch cmd=0x%04x len=%u\n",
+			cmd, length);
+		*reason = RA_REASON_CKSUM;
 		return -EBADMSG;
 	}
 
-	memcpy(raw_response, response, RA_READ_LEN);
 	return 0;
 }
 
 /* Caller must hold ra_lock. */
 static int ra_read_client_command_locked(struct i2c_client *client, u16 cmd,
-					 u8 *raw_response)
+					 u8 *raw_response, int *reason)
 {
 	int ret;
 
@@ -207,7 +269,7 @@ static int ra_read_client_command_locked(struct i2c_client *client, u16 cmd,
 
 	/* Hold the bus across the complete MAC command/read sequence. */
 	i2c_lock_bus(client->adapter, I2C_LOCK_SEGMENT);
-	ret = ra_read_mac_block(client, cmd, raw_response);
+	ret = ra_read_mac_block(client, cmd, raw_response, reason);
 	i2c_unlock_bus(client->adapter, I2C_LOCK_SEGMENT);
 	device_unlock(&client->dev);
 
@@ -263,7 +325,8 @@ static int ra_check_type4_locked(struct i2c_client *client)
 	int ret;
 	int i;
 
-	ret = ra_read_client_command_locked(client, RA_CMD_DEVICE_NAME, raw);
+	ret = ra_read_client_command_locked(client, RA_CMD_DEVICE_NAME, raw,
+		NULL);
 	if (ret)
 		return ret;
 
@@ -291,7 +354,8 @@ static int ra_read_sealed_locked(struct i2c_client *client, bool *sealed)
 	if (!sealed)
 		return -EINVAL;
 
-	ret = ra_read_client_command_locked(client, RA_CMD_OPERATION_STATUS, raw);
+	ret = ra_read_client_command_locked(client, RA_CMD_OPERATION_STATUS,
+		raw, NULL);
 	if (ret)
 		goto error;
 
@@ -468,7 +532,8 @@ static void ra_workfn(struct work_struct *work)
 	if (ra_stopping || !ra_client)
 		goto out;
 
-	ret = ra_read_client_command_locked(ra_client, ra_cmd, ra_result_raw);
+	ret = ra_read_client_command_locked(ra_client, ra_cmd, ra_result_raw,
+		&ra_result_reason);
 	ra_result_error = ret;
 	ra_result_valid = true;
 	ra_result_timestamp = jiffies;
@@ -504,6 +569,49 @@ static ssize_t ra_store_cmd(struct kobject *kobj, struct kobj_attribute *attr,
 	return count;
 }
 
+static const char *ra_reason_name(int reason)
+{
+	switch (reason) {
+	case RA_REASON_OK:
+		return "ok";
+	case RA_REASON_LENGTH:
+		return "bad-length";
+	case RA_REASON_CKSUM:
+		return "checksum-mismatch";
+	case RA_REASON_EMPTY:
+		return "empty-block";
+	case RA_REASON_IO:
+		return "i2c-error";
+	default:
+		return "unknown";
+	}
+}
+
+/* DF map 里的 RA 表块：2 字节 flag + 15 个 I2（单位 2^-10 欧）。 */
+static bool ra_is_ra_block(u16 cmd)
+{
+	return cmd == RA_DF_CELL0_RA || cmd == RA_DF_CELL1_RA ||
+		cmd == RA_DF_XCELL0_RA || cmd == RA_DF_XCELL1_RA;
+}
+
+/*
+ * 按小端解释 RA 值。默认 flag 是 0xFF55，若打印出来的高低字节相反，
+ * 说明该字段用另一套字节序，以 raw_response 那一行为准。
+ */
+static void ra_emit_ra_table(char *buf, ssize_t *len, const u8 *raw)
+{
+	unsigned int flag = raw[2] | (raw[3] << 8);
+	int i;
+
+	*len += sysfs_emit_at(buf, *len, "ra_flag=0x%04x\n", flag);
+	for (i = 0; i < RA_TABLE_POINTS; i++) {
+		s16 value = (s16)(raw[4 + 2 * i] | (raw[5 + 2 * i] << 8));
+
+		*len += sysfs_emit_at(buf, *len, "ra[%02d]=%d (%d mOhm)\n",
+			i, value, value * 1000 / 1024);
+	}
+}
+
 static ssize_t ra_show_result(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -512,14 +620,19 @@ static ssize_t ra_show_result(struct kobject *kobj,
 	bool valid;
 	u16 cmd;
 	int error;
+	int reason;
 	unsigned long timestamp;
+	unsigned int settle_ms;
+	u8 length;
 	int i;
 
 	mutex_lock(&ra_lock);
 	valid = ra_result_valid;
 	cmd = ra_cmd;
 	error = ra_result_error;
+	reason = ra_result_reason;
 	timestamp = ra_result_timestamp;
+	settle_ms = ra_settle_ms;
 	memcpy(raw, ra_result_raw, RA_READ_LEN);
 	mutex_unlock(&ra_lock);
 
@@ -527,24 +640,52 @@ static ssize_t ra_show_result(struct kobject *kobj,
 		return sysfs_emit(buf, "status=pending\ncommand=0x%04x\n", cmd);
 
 	if (error)
-		return sysfs_emit(buf, "status=error\ncommand=0x%04x\n"
-			"read_error=%d\ntimestamp_jiffies=%lu\n", cmd, error,
-			timestamp);
+		len = sysfs_emit(buf, "status=error\n");
+	else if (reason == RA_REASON_EMPTY)
+		len = sysfs_emit(buf, "status=empty\n");
+	else
+		len = sysfs_emit(buf, "status=done\n");
 
-	len = sysfs_emit(buf,
-		"status=done\n"
-		"command=0x%04x\n"
-		"raw_response[0..35]=", cmd);
+	len += sysfs_emit_at(buf, len, "command=0x%04x\n", cmd);
+	if (error)
+		len += sysfs_emit_at(buf, len, "read_error=%d\n", error);
+	len += sysfs_emit_at(buf, len, "reason=%s\n", ra_reason_name(reason));
+	len += sysfs_emit_at(buf, len, "settle_ms=%u\n", settle_ms);
+
+	/* 校验通过与否都打印窗口：这是定位 DF 读取失败的唯一证据。 */
+	len += sysfs_emit_at(buf, len, "raw_response[0..35]=");
 	for (i = 0; i < RA_READ_LEN; i++)
-		len += sysfs_emit_at(buf, len, "%s%02x", i ? " " : "",
-			raw[i]);
+		len += sysfs_emit_at(buf, len, "%s%02x", i ? " " : "", raw[i]);
 	len += sysfs_emit_at(buf, len, "\n");
-	len += sysfs_emit_at(buf, len, "command_echo=%02x %02x\n",
-		raw[0], raw[1]);
+
+	len += sysfs_emit_at(buf, len,
+		"command_echo=%02x %02x (expected %02x %02x, %s)\n",
+		raw[0], raw[1], cmd & 0xff, cmd >> 8,
+		(raw[0] == (cmd & 0xff) && raw[1] == (cmd >> 8)) ?
+			"match" : "MISMATCH");
 	len += sysfs_emit_at(buf, len, "response_checksum_byte=%02x\n",
 		raw[RA_READ_LEN - 2]);
 	len += sysfs_emit_at(buf, len, "response_length_byte=%u\n",
 		raw[RA_READ_LEN - 1]);
+
+	/*
+	 * 原驱动两条路径的校验约定相差 2 字节，两个都算出来对比：
+	 *   读校验 fg_mac_read_block  -> 覆盖 length-2 字节
+	 *   写构造 fg_mac_write_block -> 覆盖 length 字节
+	 */
+	length = raw[RA_READ_LEN - 1];
+	if (length >= 3 && length <= RA_READ_LEN) {
+		len += sysfs_emit_at(buf, len,
+			"checksum_readpath=%02x (sum of first %u bytes)\n",
+			ra_checksum(raw, length - 2), length - 2);
+		len += sysfs_emit_at(buf, len,
+			"checksum_writepath=%02x (sum of first %u bytes)\n",
+			ra_checksum(raw, length), length);
+	}
+
+	if (!error && length >= 4 + 2 * RA_TABLE_POINTS && ra_is_ra_block(cmd))
+		ra_emit_ra_table(buf, &len, raw);
+
 	len += sysfs_emit_at(buf, len, "timestamp_jiffies=%lu\n", timestamp);
 
 	return len;
@@ -554,6 +695,35 @@ static struct kobj_attribute ra_store_attr =
 	__ATTR(mac_cmd, 0200, NULL, ra_store_cmd);
 static struct kobj_attribute ra_result_attr =
 	__ATTR(mac_result, 0444, ra_show_result, NULL);
+
+static ssize_t ra_show_settle(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ra_settle_ms);
+}
+
+static ssize_t ra_store_settle(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int value;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = kstrtouint(buf, 0, &value);
+	if (ret || value > RA_SETTLE_MS_MAX)
+		return -EINVAL;
+
+	mutex_lock(&ra_lock);
+	ra_settle_ms = value;
+	mutex_unlock(&ra_lock);
+
+	return count;
+}
+
+static struct kobj_attribute ra_settle_attr =
+	__ATTR(settle_ms, 0600, ra_show_settle, ra_store_settle);
 
 static int __init ra_init(void)
 {
@@ -590,11 +760,17 @@ static int __init ra_init(void)
 	if (ret)
 		goto remove_sealed;
 
-	pr_info("raR: ready for %s-%04x, read delay=%ums, type4 security nodes enabled\n",
+	ret = sysfs_create_file(ra_kobj, &ra_settle_attr.attr);
+	if (ret)
+		goto remove_seal;
+
+	pr_info("raR: ready for %s-%04x, schedule=%ums settle=%ums, type4 security nodes enabled\n",
 		dev_name(&ra_client->adapter->dev), ra_client->addr,
-		RA_WRITE_TO_READ_DELAY_MS);
+		RA_WRITE_TO_READ_DELAY_MS, ra_settle_ms);
 	return 0;
 
+remove_seal:
+	sysfs_remove_file(ra_kobj, &ra_seal_attr.attr);
 remove_sealed:
 	sysfs_remove_file(ra_kobj, &ra_sealed_attr.attr);
 remove_result:
@@ -619,6 +795,7 @@ static void __exit ra_exit(void)
 
 	if (ra_kobj) {
 		sysfs_remove_file(ra_kobj, &ra_seal_attr.attr);
+		sysfs_remove_file(ra_kobj, &ra_settle_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_sealed_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_result_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_store_attr.attr);
