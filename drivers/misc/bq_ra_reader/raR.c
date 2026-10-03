@@ -25,7 +25,6 @@
 #include <linux/mutex.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
-#include <linux/workqueue.h>
 
 /*
  * 设备内核 CONFIG_UBSAN=n + CONFIG_TRIM_UNUSED_KSYMS=y，未导出
@@ -46,12 +45,6 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 
 #define RA_REG_ALT_MAC			0x3e
 #define RA_READ_LEN			36
-/*
- * mac_cmd 只是把"发起"与"取结果"解耦的调度延迟，不参与 gauge 时序。
- * 真正落在写地址与读窗口之间的整定时间是 ra_settle_ms。
- */
-#define RA_WRITE_TO_READ_DELAY_MS	5000
-
 /*
  * 写 0x3E/0x3F 之后、读窗口之前的整定时间。原 gauge 驱动的
  * fg_mac_read_block() 用 udelay(4000)，约 4ms；可用 settle_ms 节点在不
@@ -109,7 +102,6 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 static struct i2c_client *ra_client;
 static struct kobject *ra_kobj;
 static DEFINE_MUTEX(ra_lock);
-static struct delayed_work ra_work;
 
 /* 以下字段均由 ra_lock 保护。 */
 static bool ra_stopping;
@@ -560,25 +552,10 @@ static struct kobj_attribute ra_sealed_attr =
 static struct kobj_attribute ra_seal_attr =
 	__ATTR(seal, 0600, ra_show_sealed, ra_store_seal);
 
-static void ra_workfn(struct work_struct *work)
-{
-	int ret;
-
-	(void)work;
-	mutex_lock(&ra_lock);
-	if (ra_stopping || !ra_client)
-		goto out;
-
-	ret = ra_read_client_command_locked(ra_client, ra_cmd, ra_result_raw,
-		&ra_result_reason);
-	ra_result_error = ret;
-	ra_result_valid = true;
-	ra_result_timestamp = jiffies;
-
-out:
-	mutex_unlock(&ra_lock);
-}
-
+/*
+ * 写地址与读窗口本来就是原子的，排一个延迟工作没有意义；同步执行之后
+ * 一个 shell 循环就能扫完整片子命令/地址空间（每次约 10ms）。
+ */
 static ssize_t ra_store_cmd(struct kobject *kobj, struct kobj_attribute *attr,
 			    const char *buf, size_t count)
 {
@@ -596,11 +573,14 @@ static ssize_t ra_store_cmd(struct kobject *kobj, struct kobj_attribute *attr,
 		mutex_unlock(&ra_lock);
 		return -ENODEV;
 	}
+
 	ra_cmd = cmd;
-	ra_result_valid = false;
-	ra_result_error = 0;
-	mod_delayed_work(system_wq, &ra_work,
-		msecs_to_jiffies(RA_WRITE_TO_READ_DELAY_MS));
+	ra_result_reason = RA_REASON_OK;
+	ret = ra_read_client_command_locked(ra_client, cmd, ra_result_raw,
+		&ra_result_reason);
+	ra_result_error = ret;
+	ra_result_valid = true;
+	ra_result_timestamp = jiffies;
 	mutex_unlock(&ra_lock);
 
 	return count;
@@ -931,7 +911,6 @@ static int __init ra_init(void)
 	struct ra_find_context context = {};
 	int ret;
 
-	INIT_DELAYED_WORK(&ra_work, ra_workfn);
 	ra_stopping = false;
 
 	ret = i2c_for_each_dev(&context, ra_find_client);
@@ -977,9 +956,9 @@ static int __init ra_init(void)
 	if (ret)
 		goto remove_force_unseal;
 
-	pr_info("raR: ready for %s-%04x, schedule=%ums settle=%ums, type4 security nodes enabled\n",
+	pr_info("raR: ready for %s-%04x, sync read, settle=%ums, type4 security nodes enabled\n",
 		dev_name(&ra_client->adapter->dev), ra_client->addr,
-		RA_WRITE_TO_READ_DELAY_MS, ra_settle_ms);
+		ra_settle_ms);
 	return 0;
 
 remove_force_unseal:
@@ -1010,7 +989,6 @@ static void __exit ra_exit(void)
 	mutex_lock(&ra_lock);
 	ra_stopping = true;
 	mutex_unlock(&ra_lock);
-	cancel_delayed_work_sync(&ra_work);
 
 	if (ra_kobj) {
 		sysfs_remove_file(ra_kobj, &ra_seal_attr.attr);
