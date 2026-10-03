@@ -73,6 +73,12 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define RA_REG_DUMP_LAST		0x7f
 #define RA_REG_DUMP_LEN			(RA_REG_DUMP_LAST - RA_REG_DUMP_FIRST + 1)
 
+/*
+ * NFG1000B/NVT 私有布局：RA 行在 DF 0x4442，32 字节 = 2 字节基值 + 15 个 I2
+ * （单位 2^-10 欧）。TI 布局的 0x4100/0x4140 等地址在这颗包上实测无响应。
+ */
+#define RA_DF_PACK_RA			0x4442
+
 /* RA 表所在的四个 32 字节 DF 块（Cell0/Cell1 及其影子表）。 */
 #define RA_DF_CELL0_RA			0x4100
 #define RA_DF_CELL1_RA			0x4140
@@ -746,6 +752,63 @@ static struct kobj_attribute ra_store_attr =
 static struct kobj_attribute ra_result_attr =
 	__ATTR(mac_result, 0444, ra_show_result, NULL);
 
+/*
+ * 只读节点 ra_table：读 NFG1000B/NVT 布局的 RA 行（DF 0x4442）并按 mΩ 打印。
+ * 需要 gauge 处于 UNSEALED（DF 读取的前提）；只写 0x3E/0x3F 的命令字，从不写
+ * 数据窗口，所以不会提交任何 DF 写入，也不改变安全状态。
+ */
+static ssize_t ra_show_table(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	u8 raw[RA_READ_LEN] = {0};
+	ssize_t len = 0;
+	int reason = RA_REASON_OK;
+	u8 length;
+	int ret;
+	int i;
+
+	mutex_lock(&ra_lock);
+	if (ra_stopping || !ra_client) {
+		mutex_unlock(&ra_lock);
+		return sysfs_emit(buf, "status=no-device\n");
+	}
+
+	ret = ra_read_client_command_locked(ra_client, RA_DF_PACK_RA, raw,
+		&reason);
+	mutex_unlock(&ra_lock);
+
+	length = raw[RA_READ_LEN - 1];
+
+	if (ret || (reason != RA_REASON_OK && reason != RA_REASON_UNCHANGED) ||
+	    length != RA_READ_LEN) {
+		len += sysfs_emit(buf, "status=error\ncommand=0x%04x\n",
+			RA_DF_PACK_RA);
+		len += sysfs_emit_at(buf, len, "read_error=%d\n", ret);
+		len += sysfs_emit_at(buf, len, "reason=%s\n",
+			ra_reason_name(reason));
+		len += sysfs_emit_at(buf, len, "length=%u\n", length);
+		len += sysfs_emit_at(buf, len,
+			"hint=unseal first: echo 0 > /sys/kernel/raR/seal\n");
+		return len;
+	}
+
+	len += sysfs_emit(buf, "status=done\ncommand=0x%04x\n", RA_DF_PACK_RA);
+	len += sysfs_emit_at(buf, len, "reason=%s\n", ra_reason_name(reason));
+	/* 第 0 个 u16 是基准量（身份未明），其后 15 个是内阻，单位 2^-10 欧。 */
+	len += sysfs_emit_at(buf, len, "base=%u\n", raw[2] | (raw[3] << 8));
+	for (i = 0; i < RA_TABLE_POINTS; i++) {
+		s16 value = (s16)(raw[4 + 2 * i] | (raw[5 + 2 * i] << 8));
+
+		len += sysfs_emit_at(buf, len, "ra[%02d]=%d (%d mOhm)\n",
+			i + 1, value, value * 1000 / 1024);
+	}
+
+	return len;
+}
+
+static struct kobj_attribute ra_table_attr =
+	__ATTR(ra_table, 0444, ra_show_table, NULL);
+
 static ssize_t ra_show_settle(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -987,11 +1050,17 @@ static int __init ra_init(void)
 	if (ret)
 		goto remove_force_unseal;
 
+	ret = sysfs_create_file(ra_kobj, &ra_table_attr.attr);
+	if (ret)
+		goto remove_regs;
+
 	pr_info("raR: ready for %s-%04x, sync read, settle=%ums, type4 security nodes enabled\n",
 		dev_name(&ra_client->adapter->dev), ra_client->addr,
 		ra_settle_ms);
 	return 0;
 
+remove_regs:
+	sysfs_remove_file(ra_kobj, &ra_regs_attr.attr);
 remove_force_unseal:
 	sysfs_remove_file(ra_kobj, &ra_force_unseal_attr.attr);
 remove_security:
@@ -1025,6 +1094,7 @@ static void __exit ra_exit(void)
 		sysfs_remove_file(ra_kobj, &ra_seal_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_settle_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_regs_attr.attr);
+		sysfs_remove_file(ra_kobj, &ra_table_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_force_unseal_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_security_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_sealed_attr.attr);
