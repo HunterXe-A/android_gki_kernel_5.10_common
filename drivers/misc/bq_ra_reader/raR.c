@@ -60,6 +60,7 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define RA_REASON_EMPTY			3
 #define RA_REASON_IO			4
 #define RA_REASON_STALE			5
+#define RA_REASON_UNCHANGED		6
 
 /* 0x0054 payload byte 1 & 0x03：TI gauge 的安全等级。 */
 #define RA_SECURITY_FULL_ACCESS		0x01
@@ -276,6 +277,16 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 			cmd, length, ra_reason_name(*reason));
 		return -EBADMSG;
 	}
+
+	/*
+	 * 命令被忽略时窗口内容不变，但校验和是否通过取决于新旧 echo 的字节和
+	 * 是否恰好相同（见上面的 stale 分支），所以"校验通过"并不足以证明
+	 * gauge 真的响应了这条命令。这里无条件把命令前后的窗口比一遍：
+	 * 扫 DF 时只认 reason=ok，得到的就是干净的真实记录表。
+	 * 注意：同一条命令连读两次也会命中这里（窗口确实没变）。
+	 */
+	if (!memcmp(&response[2], &before[2], RA_READ_LEN - 2))
+		*reason = RA_REASON_UNCHANGED;
 
 	return 0;
 }
@@ -602,6 +613,8 @@ static const char *ra_reason_name(int reason)
 		return "i2c-error";
 	case RA_REASON_STALE:
 		return "stale-window";
+	case RA_REASON_UNCHANGED:
+		return "window-unchanged";
 	default:
 		return "unknown";
 	}
