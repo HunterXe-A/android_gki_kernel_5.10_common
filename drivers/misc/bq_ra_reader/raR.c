@@ -66,6 +66,18 @@ void __ubsan_handle_cfi_check_fail_abort(void *data, void *ptr, void *vtable)
 #define RA_REASON_CKSUM			2
 #define RA_REASON_EMPTY			3
 #define RA_REASON_IO			4
+#define RA_REASON_STALE			5
+
+/* 0x0054 payload byte 1 & 0x03：TI gauge 的安全等级。 */
+#define RA_SECURITY_FULL_ACCESS		0x01
+#define RA_SECURITY_UNSEALED		0x02
+#define RA_SECURITY_SEALED		0x03
+#define RA_FORCE_UNSEAL_MAX		5
+
+/* regs 节点转储的寄存器范围（用于确认 DF 数据是否落在别的窗口）。 */
+#define RA_REG_DUMP_FIRST		0x00
+#define RA_REG_DUMP_LAST		0x7f
+#define RA_REG_DUMP_LEN			(RA_REG_DUMP_LAST - RA_REG_DUMP_FIRST + 1)
 
 /* RA 表所在的四个 32 字节 DF 块（Cell0/Cell1 及其影子表）。 */
 #define RA_DF_CELL0_RA			0x4100
@@ -108,6 +120,16 @@ static u8 ra_result_raw[RA_READ_LEN];
 static unsigned long ra_result_timestamp;
 static int ra_result_reason;
 static unsigned int ra_settle_ms = RA_SETTLE_MS_DEFAULT;
+
+/*
+ * 上一条读到的窗口。gauge 忽略某条命令时只有 0x3E/0x3F 被我们的写改掉，
+ * 窗口其余字节与上一条响应完全相同，据此可以把"没响应"和"真的校验不过"
+ * 区分开。
+ */
+static u8 ra_prev_raw[RA_READ_LEN];
+static bool ra_prev_valid;
+
+static const char *ra_reason_name(int reason);
 
 struct ra_find_context {
 	struct i2c_client *client;
@@ -246,12 +268,22 @@ static int ra_read_mac_block(const struct i2c_client *client, u16 cmd,
 
 	/* 读路径约定：校验和覆盖 length-2 字节（见 fg_mac_read_block）。 */
 	if (ra_checksum(response, length - 2) != response[RA_READ_LEN - 2]) {
-		pr_err_ratelimited("raR: MAC checksum mismatch cmd=0x%04x len=%u\n",
-			cmd, length);
-		*reason = RA_REASON_CKSUM;
+		if (ra_prev_valid &&
+		    !memcmp(&response[2], &ra_prev_raw[2], RA_READ_LEN - 2))
+			*reason = RA_REASON_STALE;
+		else
+			*reason = RA_REASON_CKSUM;
+
+		pr_err_ratelimited("raR: MAC checksum mismatch cmd=0x%04x len=%u (%s)\n",
+			cmd, length, ra_reason_name(*reason));
+
+		ra_prev_valid = true;
+		memcpy(ra_prev_raw, response, RA_READ_LEN);
 		return -EBADMSG;
 	}
 
+	ra_prev_valid = true;
+	memcpy(ra_prev_raw, response, RA_READ_LEN);
 	return 0;
 }
 
@@ -587,6 +619,8 @@ static const char *ra_reason_name(int reason)
 		return "empty-block";
 	case RA_REASON_IO:
 		return "i2c-error";
+	case RA_REASON_STALE:
+		return "stale-window";
 	default:
 		return "unknown";
 	}
@@ -730,6 +764,168 @@ static ssize_t ra_store_settle(struct kobject *kobj,
 static struct kobj_attribute ra_settle_attr =
 	__ATTR(settle_ms, 0600, ra_show_settle, ra_store_settle);
 
+static const char *ra_security_name(u8 mode)
+{
+	switch (mode) {
+	case RA_SECURITY_FULL_ACCESS:
+		return "FULL-ACCESS";
+	case RA_SECURITY_UNSEALED:
+		return "UNSEALED";
+	case RA_SECURITY_SEALED:
+		return "SEALED";
+	default:
+		return "unknown";
+	}
+}
+
+/* Caller must hold ra_lock. 读 0x0054 的 payload byte 1（安全等级）。 */
+static int ra_read_security_locked(struct i2c_client *client, u8 *mode)
+{
+	u8 raw[RA_READ_LEN];
+	int ret;
+
+	ret = ra_read_client_command_locked(client, RA_CMD_OPERATION_STATUS,
+		raw, NULL);
+	if (ret)
+		return ret;
+
+	if (raw[0] != (RA_CMD_OPERATION_STATUS & 0xff) ||
+		raw[1] != (RA_CMD_OPERATION_STATUS >> 8) ||
+		raw[RA_READ_LEN - 1] < RA_STATUS_DATA_LEN + 4)
+		return -EBADMSG;
+
+	*mode = raw[3] & 0x03;
+	return 0;
+}
+
+static ssize_t ra_show_security(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	u8 mode = 0;
+	int ret;
+
+	mutex_lock(&ra_lock);
+	if (ra_stopping || !ra_client) {
+		ret = -ENODEV;
+	} else {
+		ret = ra_check_type4_locked(ra_client);
+		if (!ret)
+			ret = ra_read_security_locked(ra_client, &mode);
+	}
+	mutex_unlock(&ra_lock);
+
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "mode=%u (%s)\n", mode, ra_security_name(mode));
+}
+
+/*
+ * TI gauge 的 FULL ACCESS 通常要在已经 UNSEALED 的状态下再输一遍 key 才能
+ * 到达，而 sealed 节点在"已经是未封存"时会短路、不再发 key。这里给一个强制
+ * 入口：写 N 就发 N 轮 unseal key（两套候选 key 交替），随后用 security 节点
+ * 看是否升到了 FULL-ACCESS(1)。
+ */
+static ssize_t ra_store_force_unseal(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	static unsigned int round;
+	unsigned int times;
+	unsigned int i;
+	u8 mode = 0;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	ret = kstrtouint(buf, 0, &times);
+	if (ret || times < 1 || times > RA_FORCE_UNSEAL_MAX)
+		return -EINVAL;
+
+	mutex_lock(&ra_lock);
+	if (ra_stopping || !ra_client) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	ret = ra_check_type4_locked(ra_client);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < times; i++) {
+		ret = ra_send_unseal_key_locked(ra_client,
+			ra_unseal_keys[round++ % ARRAY_SIZE(ra_unseal_keys)]);
+		if (ret)
+			break;
+		msleep(RA_SECURITY_POLL_DELAY_MS);
+	}
+	if (!ret)
+		ret = ra_read_security_locked(ra_client, &mode);
+
+out:
+	mutex_unlock(&ra_lock);
+	if (ret)
+		return ret;
+
+	pr_info("raR: force unseal x%u -> security mode %u (%s)\n", times, mode,
+		ra_security_name(mode));
+	return count;
+}
+
+/*
+ * 把 0x00..0x7F 整个寄存器窗口转储出来，用于确认 DF 数据是不是落在
+ * 0x40..0x5F 之外的窗口（若某条 DF 命令后别处出现新数据，路径就找到了）。
+ */
+static ssize_t ra_show_regs(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	u8 value;
+	ssize_t len = 0;
+	int ret = 0;
+	int i;
+
+	mutex_lock(&ra_lock);
+	if (ra_stopping || !ra_client) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	device_lock(&ra_client->dev);
+	if (!ra_client->dev.driver ||
+		strcmp(ra_client->dev.driver->name, RA_DRIVER_NAME)) {
+		device_unlock(&ra_client->dev);
+		ret = -ENODEV;
+		goto out;
+	}
+
+	i2c_lock_bus(ra_client->adapter, I2C_LOCK_SEGMENT);
+	for (i = 0; i < RA_REG_DUMP_LEN; i++) {
+		ret = ra_smbus_byte_data(ra_client, true,
+			RA_REG_DUMP_FIRST + i, &value);
+		if (ret)
+			break;
+		len += sysfs_emit_at(buf, len, "%02x:%02x ",
+			RA_REG_DUMP_FIRST + i, value);
+	}
+	i2c_unlock_bus(ra_client->adapter, I2C_LOCK_SEGMENT);
+	device_unlock(&ra_client->dev);
+
+out:
+	mutex_unlock(&ra_lock);
+	if (ret < 0)
+		return ret;
+
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
+}
+
+static struct kobj_attribute ra_security_attr =
+	__ATTR(security, 0444, ra_show_security, NULL);
+static struct kobj_attribute ra_force_unseal_attr =
+	__ATTR(force_unseal, 0200, NULL, ra_store_force_unseal);
+static struct kobj_attribute ra_regs_attr =
+	__ATTR(regs, 0444, ra_show_regs, NULL);
+
 static int __init ra_init(void)
 {
 	struct ra_find_context context = {};
@@ -769,11 +965,29 @@ static int __init ra_init(void)
 	if (ret)
 		goto remove_seal;
 
+	ret = sysfs_create_file(ra_kobj, &ra_security_attr.attr);
+	if (ret)
+		goto remove_settle;
+
+	ret = sysfs_create_file(ra_kobj, &ra_force_unseal_attr.attr);
+	if (ret)
+		goto remove_security;
+
+	ret = sysfs_create_file(ra_kobj, &ra_regs_attr.attr);
+	if (ret)
+		goto remove_force_unseal;
+
 	pr_info("raR: ready for %s-%04x, schedule=%ums settle=%ums, type4 security nodes enabled\n",
 		dev_name(&ra_client->adapter->dev), ra_client->addr,
 		RA_WRITE_TO_READ_DELAY_MS, ra_settle_ms);
 	return 0;
 
+remove_force_unseal:
+	sysfs_remove_file(ra_kobj, &ra_force_unseal_attr.attr);
+remove_security:
+	sysfs_remove_file(ra_kobj, &ra_security_attr.attr);
+remove_settle:
+	sysfs_remove_file(ra_kobj, &ra_settle_attr.attr);
 remove_seal:
 	sysfs_remove_file(ra_kobj, &ra_seal_attr.attr);
 remove_sealed:
@@ -801,6 +1015,9 @@ static void __exit ra_exit(void)
 	if (ra_kobj) {
 		sysfs_remove_file(ra_kobj, &ra_seal_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_settle_attr.attr);
+		sysfs_remove_file(ra_kobj, &ra_regs_attr.attr);
+		sysfs_remove_file(ra_kobj, &ra_force_unseal_attr.attr);
+		sysfs_remove_file(ra_kobj, &ra_security_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_sealed_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_result_attr.attr);
 		sysfs_remove_file(ra_kobj, &ra_store_attr.attr);
