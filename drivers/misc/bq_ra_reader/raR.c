@@ -688,6 +688,8 @@ static ssize_t ra_show_result(struct kobject *kobj,
 	len += sysfs_emit_at(buf, len, "response_length_byte=%u\n",
 		raw[RA_READ_LEN - 1]);
 
+	length = raw[RA_READ_LEN - 1];
+
 	/*
 	 * 满 32 字节 payload（length==36）时给一份 u16 小端视图：找 Ra Table
 	 * 这类"连续多个 I2"的数据块时，一眼就能看出形态，不用另外解码。
@@ -709,7 +711,6 @@ static ssize_t ra_show_result(struct kobject *kobj,
 	 *   读校验 fg_mac_read_block  -> 覆盖 length-2 字节
 	 *   写构造 fg_mac_write_block -> 覆盖 length 字节
 	 */
-	length = raw[RA_READ_LEN - 1];
 	if (length >= 3 && length <= RA_READ_LEN) {
 		len += sysfs_emit_at(buf, len,
 			"checksum_readpath=%02x (sum of first %u bytes)\n",
