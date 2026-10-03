@@ -689,6 +689,22 @@ static ssize_t ra_show_result(struct kobject *kobj,
 		raw[RA_READ_LEN - 1]);
 
 	/*
+	 * 满 32 字节 payload（length==36）时给一份 u16 小端视图：找 Ra Table
+	 * 这类"连续多个 I2"的数据块时，一眼就能看出形态，不用另外解码。
+	 */
+	if (length == RA_READ_LEN) {
+		len += sysfs_emit_at(buf, len, "payload_u16[0..15]=");
+		for (i = 0; i < (RA_READ_LEN - 4) / 2; i++) {
+			s16 value = (s16)(raw[2 + 2 * i] |
+				(raw[3 + 2 * i] << 8));
+
+			len += sysfs_emit_at(buf, len, "%s%d", i ? " " : "",
+				value);
+		}
+		len += sysfs_emit_at(buf, len, "\n");
+	}
+
+	/*
 	 * 原驱动两条路径的校验约定相差 2 字节，两个都算出来对比：
 	 *   读校验 fg_mac_read_block  -> 覆盖 length-2 字节
 	 *   写构造 fg_mac_write_block -> 覆盖 length 字节
